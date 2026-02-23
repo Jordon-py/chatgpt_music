@@ -522,7 +522,12 @@ class RecentJobsInput(BaseModel):
 # -------------------------------------------------------------------------
 # FastMCP tools
 # -------------------------------------------------------------------------
-mcp = FastMCP("AuralMind Mastering Server")
+# Bind FastMCP to 0.0.0.0 in server mode so host-header protection
+# does not auto-lock to localhost-only defaults.
+mcp = FastMCP(
+    "AuralMind Mastering Server",
+    host=os.getenv("FASTMCP_BIND_HOST", "0.0.0.0"),
+)
 
 @mcp.tool(
     name="server_health",
