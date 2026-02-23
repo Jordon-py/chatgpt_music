@@ -21,6 +21,11 @@
       "value": "competitive_trap",
       "required": false
     },
+    "MAX_JSON_MB": {
+      "description": "JSON body cap for base64 uploads via MCP tools",
+      "value": "100",
+      "required": false
+    },
     "MAX_UPLOAD_MB": {
       "value": "200",
       "required": false

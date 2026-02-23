@@ -141,7 +141,7 @@ heroku logs --tail
 3. Add your custom connector/app and point it to your MCP URL.
 4. Ask ChatGPT to:
    - call `plan_trap_master`
-   - call `start_master_job`
+   - call `start_master_job_from_upload` for uploaded bytes (or `start_master_job` for URLs)
    - poll `get_job_status`
    - return the download/report links
 
@@ -172,9 +172,16 @@ Takes high-level musical intent (style/loudness/brightness/width/punch/etc.) and
 
 ### `start_master_job`
 Queues a mastering job using:
-- `source_url` (recommended for remote/ChatGPT)
+- `source_url` (remote URL)
 - or `local_target_path` (dev only)
 - optional reference URL/path
+- preset + overrides
+
+### `start_master_job_from_upload`
+Queues a mastering job using:
+- base64 audio bytes (`source_data_base64`)
+- `source_filename` for format detection
+- optional base64 reference + filename
 - preset + overrides
 
 ### `get_job_status`
@@ -226,10 +233,11 @@ curl -L "http://127.0.0.1:8000/api/jobs/<job_id>/download" -o mastered.wav
 
 ## Environment Variables
 
-- `MCP_PUBLIC_BASE_URL` — used to generate absolute URLs in responses
-- `AURALMIND_JOBS_DIR` — working dir for job files (`/tmp/auralmind_jobs` by default)
-- `MAX_UPLOAD_MB` — multipart upload cap
-- `MAX_DOWNLOAD_MB` — remote URL download cap
+- `MCP_PUBLIC_BASE_URL` - used to generate absolute URLs in responses
+- `AURALMIND_JOBS_DIR` - working dir for job files (`/tmp/auralmind_jobs` by default)
+- `MAX_JSON_MB` - JSON body cap (base64 uploads via MCP tools)
+- `MAX_UPLOAD_MB` - multipart upload cap
+- `MAX_DOWNLOAD_MB` - remote URL download cap
 - `ALLOWED_DOWNLOAD_HOSTS` — optional comma-separated hostname allowlist
 - `ALLOW_LOCAL_FILES` — dev-only local path mode (`false` in production)
 - `AURALMIND_SCRIPT_PATH` — path to your mastering script

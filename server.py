@@ -16,12 +16,14 @@ Deployment target
 from __future__ import annotations
 
 import base64
+import hashlib
 import ipaddress
 import json
 import logging
 import os
 import shutil
 import socket
+import tempfile
 
 import threading
 import time
@@ -71,6 +73,7 @@ SCRIPT_PATH = os.getenv(
 JOBS_DIR = Path(os.getenv("AURALMIND_JOBS_DIR", "/tmp/auralmind_jobs")).resolve()
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
+MAX_JSON_MB = int(os.getenv("MAX_JSON_MB", "100"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "200"))
 MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "250"))
 JOB_MAX_WORKERS = max(1, int(os.getenv("JOB_MAX_WORKERS", "2")))
@@ -104,6 +107,37 @@ def _public_url(path: str) -> str:
 # -------------------------------------------------------------------------
 # Security / file utilities
 # -------------------------------------------------------------------------
+def _is_json_content_type(content_type: str) -> bool:
+    if not content_type:
+        return False
+    mime = content_type.split(";", 1)[0].strip().lower()
+    return mime == "application/json" or mime.endswith("+json")
+
+
+def _visible_roots() -> list[str]:
+    roots = {str(JOBS_DIR)}
+    try:
+        roots.add(str(Path(tempfile.gettempdir()).resolve()))
+    except Exception:
+        pass
+    return sorted(roots)
+
+
+def _local_path_error_payload(*, kind: str, original_path: str, resolved_path: Path, exists: bool) -> dict[str, Any]:
+    if ALLOW_LOCAL_FILES:
+        error = f"{kind} file not visible to AuralMind runtime"
+    else:
+        error = f"Local {kind.lower()} mode disabled (ALLOW_LOCAL_FILES=false)"
+    return {
+        "error": error,
+        "original_path": original_path,
+        "resolved_path": str(resolved_path),
+        "exists": exists,
+        "suggested_fix": "Use start_master_job_from_upload (base64) or source_url",
+        "visible_roots": _visible_roots(),
+    }
+
+
 def _ensure_private_path(p: Path, *, must_exist: bool = False) -> Path:
     p = p.resolve()
     try:
@@ -239,13 +273,14 @@ class StartJobInput(BaseModel):
 
     Typical ChatGPT flow:
       1. Call plan_trap_master to get a preset + overrides.
-      2. Pass those into this tool along with a source_url.
+      2. If you have a URL, pass it into this tool along with source_url.
+         If you have uploaded bytes, use start_master_job_from_upload instead.
       3. Poll get_job_status until status is 'completed' or 'failed'.
     """
     source_url: Optional[str] = Field(
         default=None,
         description="HTTPS URL pointing to the target audio file (WAV/MP3/FLAC). "
-                    "This is the preferred input for remote ChatGPT flows. Use a pre-signed S3/GCS link or any public audio URL."
+                    "Use this when you have a URL. For uploaded bytes, use start_master_job_from_upload instead."
     )
     local_target_path: Optional[str] = Field(
         default=None,
@@ -625,7 +660,8 @@ mcp = FastMCP(
         "2. Call server_health to confirm the engine is loaded.\n"
         "3. Call list_presets to see available mastering presets.\n"
         "4. (Optional) Call plan_trap_master with a high-level TrapMasterIntent to get recommended preset + overrides.\n"
-        "5. Call start_master_job (with source_url) OR start_master_job_from_upload (with base64 audio data).\n"
+        "5. If you have raw file bytes (ChatGPT upload), call start_master_job_from_upload (base64). "
+        "Otherwise call start_master_job with source_url.\n"
         "6. Poll get_job_status every 5-10 seconds until status is 'completed' or 'failed'.\n"
         "7. When completed, the response includes download URLs for the mastered audio, report, and result JSON.\n"
         "If a job fails, check the 'error' field in get_job_status for diagnostics."
@@ -667,6 +703,7 @@ def server_health() -> dict[str, Any]:
             "jobs_dir": str(JOBS_DIR),
             "default_preset": DEFAULT_PRESET,
             "allow_local_files": ALLOW_LOCAL_FILES,
+            "max_json_mb": MAX_JSON_MB,
             "max_upload_mb": MAX_UPLOAD_MB,
             "max_download_mb": MAX_DOWNLOAD_MB,
             "engine": info,
@@ -722,7 +759,8 @@ def plan_trap_master(payload: TrapMasterIntent) -> dict[str, Any]:
     name="start_master_job",
     description=(
         "Queue a new mastering job and return immediately with a job_id. "
-        "You MUST provide exactly one source: source_url (preferred for ChatGPT) or local_target_path (dev only). "
+        "You MUST provide exactly one source: source_url or local_target_path (dev only). "
+        "If you have uploaded bytes (e.g., ChatGPT file upload), use start_master_job_from_upload instead. "
         "Optionally provide a reference track URL for tonal matching. "
         "After calling this, poll get_job_status with the returned job_id every 5-10 seconds. "
         "When status='completed', the response includes download URLs for the mastered audio and report."
@@ -738,17 +776,41 @@ def start_master_job(payload: StartJobInput) -> dict[str, Any]:
     if payload.reference_url and payload.local_reference_path:
         raise ValueError("Provide only one of reference_url or local_reference_path")
 
+    local_target_resolved = None
+    if payload.local_target_path:
+        local_target_resolved = Path(payload.local_target_path).expanduser().resolve(strict=False)
+        if not ALLOW_LOCAL_FILES or not local_target_resolved.exists():
+            error_payload = _local_path_error_payload(
+                kind="Target",
+                original_path=payload.local_target_path,
+                resolved_path=local_target_resolved,
+                exists=local_target_resolved.exists(),
+            )
+            raise ValueError(json.dumps(error_payload))
+
+    local_reference_resolved = None
+    if payload.local_reference_path:
+        local_reference_resolved = Path(payload.local_reference_path).expanduser().resolve(strict=False)
+        if not ALLOW_LOCAL_FILES or not local_reference_resolved.exists():
+            error_payload = _local_path_error_payload(
+                kind="Reference",
+                original_path=payload.local_reference_path,
+                resolved_path=local_reference_resolved,
+                exists=local_reference_resolved.exists(),
+            )
+            raise ValueError(json.dumps(error_payload))
+
     source: dict[str, Any]
     if payload.source_url:
         source = {"mode": "url", "url": payload.source_url}
     else:
-        source = {"mode": "local_path", "path": payload.local_target_path}
+        source = {"mode": "local_path", "path": str(local_target_resolved)}
 
     reference: Optional[dict[str, Any]] = None
     if payload.reference_url:
         reference = {"mode": "url", "url": payload.reference_url}
     elif payload.local_reference_path:
-        reference = {"mode": "local_path", "path": payload.local_reference_path}
+        reference = {"mode": "local_path", "path": str(local_reference_resolved)}
 
     # Validate overrides up front so the LLM gets immediate feedback.
     engine.validate_overrides(payload.overrides)
@@ -801,42 +863,67 @@ def list_recent_jobs(payload: RecentJobsInput) -> dict[str, Any]:
     ),
 )
 def start_master_job_from_upload(payload: UploadJobInput) -> dict[str, Any]:
+    def _upload_log(message: str) -> None:
+        log.info("[auralmind-upload] %s", message)
+
     # Validate overrides up front.
     engine.validate_overrides(payload.overrides)
     engine.split_virtual_master_args(payload.overrides)
 
     # Decode source audio.
+    _upload_log(f"source_filename={payload.source_filename}")
+    _upload_log(f"b64_chars={len(payload.source_data_base64)}")
     try:
         source_bytes = base64.b64decode(payload.source_data_base64, validate=True)
     except Exception as e:
+        _upload_log(f"base64_decode_error={type(e).__name__}: {e}")
         raise ValueError(f"source_data_base64 is not valid base64: {e}") from e
     if len(source_bytes) < 128:
+        _upload_log(f"decoded_bytes_too_small={len(source_bytes)}")
         raise ValueError("Decoded source audio is too small to be a valid file")
+    _upload_log(f"decoded_bytes={len(source_bytes)}")
+    _upload_log(f"sha256_prefix={hashlib.sha256(source_bytes).hexdigest()[:16]}")
 
     job_id = uuid.uuid4().hex
     job_dir = jobs._job_dir(job_id)
+    _upload_log(f"staging_job_id={job_id}")
+    _upload_log(f"staging_dir={job_dir}")
     target_name = _safe_filename(payload.source_filename, "target.wav")
     target_dest = job_dir / target_name
     target_dest.write_bytes(source_bytes)
+    _upload_log(f"tmp_path={target_dest}")
+    target_exists = target_dest.exists()
+    target_size = target_dest.stat().st_size if target_exists else 0
+    _upload_log(f"exists={target_exists} size={target_size}")
 
     source = {"mode": "local_path", "path": str(target_dest), "uploaded_via": "mcp_base64"}
 
     # Decode optional reference.
     reference = None
     if payload.reference_data_base64:
+        _upload_log(f"reference_filename={payload.reference_filename}")
+        _upload_log(f"reference_b64_chars={len(payload.reference_data_base64)}")
         try:
             ref_bytes = base64.b64decode(payload.reference_data_base64, validate=True)
         except Exception as e:
+            _upload_log(f"reference_base64_decode_error={type(e).__name__}: {e}")
             raise ValueError(f"reference_data_base64 is not valid base64: {e}") from e
+        _upload_log(f"reference_decoded_bytes={len(ref_bytes)}")
+        _upload_log(f"reference_sha256_prefix={hashlib.sha256(ref_bytes).hexdigest()[:16]}")
         ref_name = _safe_filename(payload.reference_filename, "reference.wav")
         ref_dest = job_dir / ref_name
         ref_dest.write_bytes(ref_bytes)
+        _upload_log(f"reference_tmp_path={ref_dest}")
+        ref_exists = ref_dest.exists()
+        ref_size = ref_dest.stat().st_size if ref_exists else 0
+        _upload_log(f"reference_exists={ref_exists} size={ref_size}")
         reference = {"mode": "local_path", "path": str(ref_dest), "uploaded_via": "mcp_base64"}
 
     # Submit with local-file semantics (files are already in jobs dir).
     prev_allow = ALLOW_LOCAL_FILES
     globals()["ALLOW_LOCAL_FILES"] = True
     try:
+        _upload_log("delegating_job_submit")
         view = jobs.submit(
             source=source,
             reference=reference,
@@ -845,6 +932,7 @@ def start_master_job_from_upload(payload: UploadJobInput) -> dict[str, Any]:
             notes_for_llm=payload.notes_for_llm,
             dither_seed=payload.dither_seed,
         )
+        _upload_log(f"job_submitted_id={view.job_id}")
     finally:
         globals()["ALLOW_LOCAL_FILES"] = prev_allow
 
@@ -888,6 +976,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def _limit_json_body(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH"} and _is_json_content_type(request.headers.get("content-type", "")):
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_JSON_MB * 1024 * 1024:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": f"Request body exceeds MAX_JSON_MB ({MAX_JSON_MB} MB)"},
+                    )
+            except ValueError:
+                pass
+    return await call_next(request)
+
 @app.get("/healthz")
 def healthz() -> dict[str, Any]:
     try:
@@ -899,6 +1002,7 @@ def healthz() -> dict[str, Any]:
             "engine_script_path": SCRIPT_PATH,
             "preset_count": len(preset_names),
             "presets": preset_names,
+            "max_json_mb": MAX_JSON_MB,
         }
     except Exception as e:
         return {"ok": False, "time": _iso(), "error": f"{type(e).__name__}: {e}"}
@@ -926,7 +1030,7 @@ async def create_job_via_upload(
 ) -> JSONResponse:
     """Multipart upload endpoint for non-MCP clients (browser/cURL/Postman).
 
-    ChatGPT MCP tool calls usually prefer `start_master_job(source_url=...)` because tool inputs are JSON.
+    ChatGPT MCP tool calls should use `start_master_job_from_upload` when sending base64 audio bytes.
     """
     try:
         overrides = json.loads(overrides_json or "{}")
