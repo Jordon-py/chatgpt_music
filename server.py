@@ -842,6 +842,25 @@ def _build_mcp_app():
     raise RuntimeError("FastMCP version does not expose http_app() / streamable_http_app()")
 
 mcp_app = _build_mcp_app()
+
+# FastMCP streamable HTTP requires its lifespan to run so session task-groups are initialized.
+# Mounted sub-app lifespans are not guaranteed to run automatically in this composition.
+_mcp_lifespan_cm = None
+
+@app.on_event("startup")
+async def _startup_mcp_app_lifespan() -> None:
+    global _mcp_lifespan_cm
+    if hasattr(mcp_app, "router") and hasattr(mcp_app.router, "lifespan_context"):
+        _mcp_lifespan_cm = mcp_app.router.lifespan_context(mcp_app)
+        await _mcp_lifespan_cm.__aenter__()
+
+@app.on_event("shutdown")
+async def _shutdown_mcp_app_lifespan() -> None:
+    global _mcp_lifespan_cm
+    if _mcp_lifespan_cm is not None:
+        await _mcp_lifespan_cm.__aexit__(None, None, None)
+        _mcp_lifespan_cm = None
+
 # Mount LAST so /healthz and /api/* routes are matched first.
 app.mount("/", mcp_app)
 
