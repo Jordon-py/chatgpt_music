@@ -21,7 +21,7 @@ import logging
 import os
 import shutil
 import socket
-import tempfile
+
 import threading
 import time
 import uuid
@@ -200,32 +200,80 @@ engine = AuralMindAdapter(SCRIPT_PATH)
 
 
 class TrapMasterIntent(BaseModel):
-    """High-level, LLM-friendly control surface for trap mastering recommendations."""
-    style: Literal["clean", "punchy", "wide", "dark", "aggressive", "radio-ready", "streaming"] = "punchy"
-    loudness_goal: Literal["safe_streaming", "competitive", "very_loud"] = "competitive"
-    brightness: int = Field(0, ge=-2, le=2, description="-2 darker, +2 brighter")
-    width: int = Field(0, ge=-2, le=2, description="-2 narrower, +2 wider")
-    punch: int = Field(1, ge=-2, le=2, description="-2 softer, +2 more punch")
-    sibilance_sensitivity: int = Field(0, ge=-2, le=2)
-    preserve_transients: bool = True
-    stem_separation: bool = False
+    """High-level, LLM-friendly control surface for trap mastering recommendations.
+
+    Use this model with the plan_trap_master tool to translate a human-readable
+    creative direction (e.g. 'punchy, competitive loudness') into concrete
+    preset + override values the mastering engine understands.
+    """
+    style: Literal["clean", "punchy", "wide", "dark", "aggressive", "radio-ready", "streaming"] = Field(
+        "punchy",
+        description="Overall sonic character. 'punchy' = tight low-end + transient snap; "
+                    "'wide' = stereo spread emphasis; 'dark' = rolled-off highs; "
+                    "'aggressive' = pushed loudness + distortion; 'radio-ready' = broadcast-safe; "
+                    "'clean' = transparent; 'streaming' = safe for Spotify/Apple normalization."
+    )
+    loudness_goal: Literal["safe_streaming", "competitive", "very_loud"] = Field(
+        "competitive",
+        description="Target loudness tier. 'safe_streaming' ≈ -13 LUFS (Spotify safe); "
+                    "'competitive' ≈ -10.5 LUFS (loud but clean); 'very_loud' ≈ -9 LUFS (max loudness, may sacrifice dynamics)."
+    )
+    brightness: int = Field(0, ge=-2, le=2, description="High-frequency tilt: -2 = noticeably darker, +2 = airy/bright. 0 = neutral.")
+    width: int = Field(0, ge=-2, le=2, description="Stereo width: -2 = narrow/mono-ish, +2 = wide stereo image. 0 = neutral.")
+    punch: int = Field(1, ge=-2, le=2, description="Transient attack energy: -2 = soft/smooth, +2 = aggressive snap. 1 = slight emphasis (trap default).")
+    sibilance_sensitivity: int = Field(0, ge=-2, le=2, description="De-esser sensitivity: -2 = less de-essing (brighter vocals), +2 = aggressive sibilance control. 0 = moderate.")
+    preserve_transients: bool = Field(True, description="Keep True for trap/hip-hop to preserve kick/snare attack. Set False only for ambient/pad-heavy material.")
+    stem_separation: bool = Field(False, description="Run Demucs stem separation before mastering. Slower + requires more RAM. Usually False unless vocals need isolated processing.")
 
 
 class StartJobInput(BaseModel):
     """MCP tool input to create a mastering job.
 
-    Use one source mode:
-    - source_url (best for ChatGPT/remote workflows with pre-signed URLs)
-    - local_target_path (dev-only; requires ALLOW_LOCAL_FILES=true)
+    Provide exactly ONE source (source_url OR local_target_path).
+    Optionally provide ONE reference track for tonal matching.
+
+    Typical ChatGPT flow:
+      1. Call plan_trap_master to get a preset + overrides.
+      2. Pass those into this tool along with a source_url.
+      3. Poll get_job_status until status is 'completed' or 'failed'.
     """
-    source_url: Optional[str] = Field(default=None, description="HTTPS URL to target audio file (preferred in remote ChatGPT flows)")
-    local_target_path: Optional[str] = Field(default=None, description="Local file path for local development only")
-    reference_url: Optional[str] = None
-    local_reference_path: Optional[str] = None
-    preset: str = Field(default=DEFAULT_PRESET)
-    overrides: dict[str, Any] = Field(default_factory=dict, description="Validated preset field overrides (safe allowlist)")
-    dither_seed: int = 0
-    notes_for_llm: Optional[str] = Field(default=None, description="Optional note/rationale to store alongside the job")
+    source_url: Optional[str] = Field(
+        default=None,
+        description="HTTPS URL pointing to the target audio file (WAV/MP3/FLAC). "
+                    "This is the preferred input for remote ChatGPT flows. Use a pre-signed S3/GCS link or any public audio URL."
+    )
+    local_target_path: Optional[str] = Field(
+        default=None,
+        description="Absolute local filesystem path to the target audio file. "
+                    "Only works when ALLOW_LOCAL_FILES=true (dev mode). Do NOT use in production/ChatGPT flows."
+    )
+    reference_url: Optional[str] = Field(
+        default=None,
+        description="HTTPS URL to a reference track for tonal/spectral matching. Optional but improves results."
+    )
+    local_reference_path: Optional[str] = Field(
+        default=None,
+        description="Local path to reference track. Dev-only; requires ALLOW_LOCAL_FILES=true."
+    )
+    preset: str = Field(
+        default=DEFAULT_PRESET,
+        description="Engine preset name. Call list_presets first to see available options. "
+                    "Common: 'competitive_trap', 'hi_fi_streaming', 'radio_loud', 'club_clean'."
+    )
+    overrides: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Dict of preset field overrides. Keys must be from the safe allowlist "
+                    "(e.g. target_lufs, softclip_mix, width_hi). Call get_preset to see all fields. "
+                    "Tip: use plan_trap_master to auto-generate good overrides from high-level intent."
+    )
+    dither_seed: int = Field(
+        default=0,
+        description="Random seed for dithering. 0 = random. Set a fixed value for reproducible output."
+    )
+    notes_for_llm: Optional[str] = Field(
+        default=None,
+        description="Free-text note stored alongside the job. Useful for tracking rationale or user instructions."
+    )
 
 
 class JobStatusView(BaseModel):
@@ -508,11 +556,11 @@ def recommend_trap_overrides(intent: TrapMasterIntent) -> dict[str, Any]:
 # MCP tool schemas (define Pydantic models before decorators)
 # -------------------------------------------------------------------------
 class PresetLookupInput(BaseModel):
-    preset: str
+    preset: str = Field(description="Exact preset name (case-sensitive). Call list_presets first to see valid names.")
 
 
 class JobLookupInput(BaseModel):
-    job_id: str
+    job_id: str = Field(description="32-char hex job ID returned by start_master_job.")
 
 
 class RecentJobsInput(BaseModel):
@@ -527,11 +575,26 @@ class RecentJobsInput(BaseModel):
 mcp = FastMCP(
     "AuralMind Mastering Server",
     host=os.getenv("FASTMCP_BIND_HOST", "0.0.0.0"),
+    instructions=(
+        "You are connected to the AuralMind mastering engine. "
+        "Follow this workflow to master a track:\n"
+        "1. Call server_health to confirm the engine is loaded.\n"
+        "2. Call list_presets to see available mastering presets.\n"
+        "3. (Optional) Call plan_trap_master with a high-level TrapMasterIntent to get recommended preset + overrides.\n"
+        "4. Call start_master_job with a source_url (or local_target_path in dev), preset, and overrides.\n"
+        "5. Poll get_job_status every 5-10 seconds until status is 'completed' or 'failed'.\n"
+        "6. When completed, the response includes download URLs for the mastered audio, report, and result JSON.\n"
+        "If a job fails, check the 'error' field in get_job_status for diagnostics."
+    ),
 )
 
 @mcp.tool(
     name="server_health",
-    description="Check server + AuralMind engine readiness. Use this first if tools fail or after deploy."
+    description=(
+        "Check server and AuralMind engine readiness. Call this FIRST when starting a session "
+        "or if any other tool returns an error. Returns: ok (bool), preset count, config summary. "
+        "If ok=false, the engine script is missing or failed to load — report the error to the user."
+    ),
 )
 def server_health() -> dict[str, Any]:
     try:
@@ -554,7 +617,11 @@ def server_health() -> dict[str, Any]:
 
 @mcp.tool(
     name="list_presets",
-    description="List AuralMind preset names and a compact summary. Use before starting a mastering job."
+    description=(
+        "List all available mastering preset names with a compact summary of key settings "
+        "(target_lufs, ceiling, sample rate, stem sep). Call this before start_master_job "
+        "to choose a preset. Common presets: competitive_trap, hi_fi_streaming, radio_loud, club_clean."
+    ),
 )
 def list_presets() -> dict[str, Any]:
     presets = engine.get_presets()
@@ -570,7 +637,11 @@ def list_presets() -> dict[str, Any]:
 
 @mcp.tool(
     name="get_preset",
-    description="Return full preset fields. Use this when planning precise overrides."
+    description=(
+        "Return ALL fields of a single preset as a JSON object. Use this to see every tunable parameter "
+        "and its current value before crafting overrides for start_master_job. "
+        "Input: {\"preset\": \"competitive_trap\"}. Returns: full preset dict."
+    ),
 )
 def get_preset(payload: PresetLookupInput) -> dict[str, Any]:
     return {"preset": payload.preset, "details": engine.get_preset_details(payload.preset)}
@@ -578,9 +649,12 @@ def get_preset(payload: PresetLookupInput) -> dict[str, Any]:
 @mcp.tool(
     name="plan_trap_master",
     description=(
-        "Create a trap-mastering starting plan (preset + safe overrides) from high-level intent. "
-        "Use this before start_master_job when the user describes a vibe like punchy/wide/dark."
-    )
+        "Translate a high-level creative direction into a concrete preset name + safe overrides dict. "
+        "Call this BEFORE start_master_job when the user describes a vibe (e.g. 'punchy and loud', "
+        "'dark and wide', 'streaming-safe'). Returns: {preset, overrides, rationale[]}. "
+        "Pass the returned preset and overrides directly into start_master_job. "
+        "You can also edit the overrides before submitting if the user requests fine-tuning."
+    ),
 )
 def plan_trap_master(payload: TrapMasterIntent) -> dict[str, Any]:
     return recommend_trap_overrides(payload)
@@ -588,9 +662,12 @@ def plan_trap_master(payload: TrapMasterIntent) -> dict[str, Any]:
 @mcp.tool(
     name="start_master_job",
     description=(
-        "Queue a mastering job. Prefer source_url/reference_url in remote ChatGPT flows "
-        "(e.g., presigned HTTPS links). local_target_path only works when ALLOW_LOCAL_FILES=true."
-    )
+        "Queue a new mastering job and return immediately with a job_id. "
+        "You MUST provide exactly one source: source_url (preferred for ChatGPT) or local_target_path (dev only). "
+        "Optionally provide a reference track URL for tonal matching. "
+        "After calling this, poll get_job_status with the returned job_id every 5-10 seconds. "
+        "When status='completed', the response includes download URLs for the mastered audio and report."
+    ),
 )
 def start_master_job(payload: StartJobInput) -> dict[str, Any]:
     if not payload.source_url and not payload.local_target_path:
@@ -633,14 +710,23 @@ def start_master_job(payload: StartJobInput) -> dict[str, Any]:
 
 @mcp.tool(
     name="get_job_status",
-    description="Poll job status. Use repeatedly after start_master_job until terminal status."
+    description=(
+        "Check the current status of a mastering job. Call repeatedly after start_master_job "
+        "until status is 'completed' or 'failed'. Status lifecycle: queued → running → completed|failed. "
+        "On 'completed': artifacts dict contains mastered_audio_url, report_url, result_json_url. "
+        "On 'failed': error field contains the exception message for diagnostics."
+    ),
 )
 def get_job_status(payload: JobLookupInput) -> dict[str, Any]:
     return jobs.get(payload.job_id).to_view().model_dump()
 
 @mcp.tool(
     name="list_recent_jobs",
-    description="List recent jobs (newest first). Useful for debugging or resuming a session."
+    description=(
+        "List the most recent mastering jobs (newest first). Returns up to 'limit' jobs (default 10, max 50). "
+        "Each entry includes job_id, status, preset, timestamps, and artifact URLs if completed. "
+        "Use this to find a previous job's ID, check what's queued, or resume a session."
+    ),
 )
 def list_recent_jobs(payload: RecentJobsInput) -> dict[str, Any]:
     return {"jobs": [j.model_dump() for j in jobs.list_recent(payload.limit)]}
@@ -649,10 +735,28 @@ def list_recent_jobs(payload: RecentJobsInput) -> dict[str, Any]:
 # -------------------------------------------------------------------------
 # HTTP API (uploads + artifact delivery + status)
 # -------------------------------------------------------------------------
+# NOTE: We must build mcp_app before creating FastAPI so we can pass its lifespan.
+# The _build_mcp_app() call is at the bottom of this file, so we use a lazy
+# lifespan that forwards to mcp_app once it exists.
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def _combined_lifespan(application):
+    """Forward lifespan to the MCP sub-app so session task-groups initialize."""
+    # mcp_app is created at module level below; by the time uvicorn starts
+    # the async lifespan, it will be available.
+    _mcp_lf = getattr(globals().get("mcp_app", None), "lifespan", None)
+    if _mcp_lf is not None:
+        async with _mcp_lf(application):
+            yield
+    else:
+        yield
+
 app = FastAPI(
     title="AuralMind FastMCP Mastering Server",
     version="1.0.0",
     description="FastAPI + FastMCP wrapper around a user-supplied AuralMind Python mastering script",
+    lifespan=_combined_lifespan,
 )
 
 app.add_middleware(
@@ -745,7 +849,7 @@ async def create_job_via_upload(
     finally:
         ALLOW_LOCAL_FILES = old_allow_local
         if prev is None:
-            os.environ.pop("ALLOW_LOCAL_FILES", None)
+            os.environ.pop("ALLOW_LOCAL_FILES", "true")
         else:
             os.environ["ALLOW_LOCAL_FILES"] = prev
 
@@ -832,42 +936,28 @@ def reload_engine() -> dict[str, Any]:
 # -------------------------------------------------------------------------
 # Mount the MCP ASGI app
 # -------------------------------------------------------------------------
+# Per FastMCP docs for FastAPI integration:
+#   - Create MCP ASGI app with path="/" (no internal prefix)
+#   - Mount it at "/mcp" on the FastAPI app
+#   - Pass lifespan=mcp_app.lifespan to FastAPI so session task-groups initialize
+# This makes the MCP endpoint reachable at /mcp/ (streamable HTTP / SSE).
+
 def _build_mcp_app():
     """Support minor FastMCP version differences."""
-    # Newer versions commonly expose http_app(path="/mcp")
+    # Use path="/" here — the mount point on FastAPI provides the prefix.
     if hasattr(mcp, "http_app"):
         try:
-            return mcp.http_app(path="/mcp")
+            return mcp.http_app(path="/")
         except TypeError:
-            # Some versions accept no args
             return mcp.http_app()
-    # Fallback seen in some versions
     if hasattr(mcp, "streamable_http_app"):
         return mcp.streamable_http_app()
     raise RuntimeError("FastMCP version does not expose http_app() / streamable_http_app()")
 
 mcp_app = _build_mcp_app()
 
-# FastMCP streamable HTTP requires its lifespan to run so session task-groups are initialized.
-# Mounted sub-app lifespans are not guaranteed to run automatically in this composition.
-_mcp_lifespan_cm = None
-
-@app.on_event("startup")
-async def _startup_mcp_app_lifespan() -> None:
-    global _mcp_lifespan_cm
-    if hasattr(mcp_app, "router") and hasattr(mcp_app.router, "lifespan_context"):
-        _mcp_lifespan_cm = mcp_app.router.lifespan_context(mcp_app)
-        await _mcp_lifespan_cm.__aenter__()
-
-@app.on_event("shutdown")
-async def _shutdown_mcp_app_lifespan() -> None:
-    global _mcp_lifespan_cm
-    if _mcp_lifespan_cm is not None:
-        await _mcp_lifespan_cm.__aexit__(None, None, None)
-        _mcp_lifespan_cm = None
-
-# Mount LAST so /healthz and /api/* routes are matched first.
-app.mount("/", mcp_app)
+# Mount at /mcp so /healthz and /api/* routes are matched by FastAPI first.
+app.mount("/mcp", mcp_app)
 
 
 # -------------------------------------------------------------------------
