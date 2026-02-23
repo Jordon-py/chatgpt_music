@@ -1,1029 +1,854 @@
+"""AuralMind FastMCP server (Heroku-ready) for LLM-orchestrated music mastering.
+
+What this gives you
+-------------------
+- Remote MCP tools ChatGPT Developer Mode can call (over Streaming HTTP/SSE depending fastmcp version)
+- HTTP endpoints for uploads, job status, report, and mastered-file download
+- Job queue + polling pattern for long-running mastering operations
+- Safe(ish) URL ingestion with SSRF guards and size limits
+- Dynamic preset overrides so the LLM can act as the "brain" controlling your AuralMind engine
+
+Deployment target
+-----------------
+- Works locally (`uvicorn server:app --reload`)
+- Heroku-ready via Procfile (`uvicorn server:app --host 0.0.0.0 --port $PORT`)
 """
-AuralMind Mastering MCP Server (ChatGPT Developer Mode / Custom MCP)
---------------------------------------------------------------------
-Purpose:
-- Expose your AuralMind mastering script as MCP tools so ChatGPT can act as the "brain"
-  and dynamically choose presets/overrides for trap masters.
-- Provide job-based mastering (start -> poll -> fetch report/artifacts)
-- Add safe file ingest/upload and artifact download endpoints.
-
-Notes:
-- Designed around auralmind_match_maestro_v7_3_expert1.py exposing:
-  - get_presets()
-  - master(target_path, out_path, preset, reference_path=None, report_path=None, ...)
-- Mounts MCP endpoint at /mcp (streamable HTTP via FastMCP http_app()).
-- Includes REST helper endpoints for uploads/downloads.
-
-If your fastmcp version has different APIs, adapt:
-- mcp = FastMCP(...)
-- mcp_app = mcp.http_app(path="/mcp")
-"""
-
 from __future__ import annotations
 
-import importlib.util
 import ipaddress
 import json
+import logging
 import os
-import re
+import shutil
 import socket
+import tempfile
 import threading
 import time
-import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal, Optional
+from urllib.parse import urlparse
 
-import requests
-import soundfile as sf
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+import httpx
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-# FastMCP import (common package name)
-from fastmcp import FastMCP
+try:
+    # Official MCP Python SDK path (preferred)
+    from mcp.server.fastmcp import FastMCP
+except Exception:
+    try:
+        # Some community examples/packages expose FastMCP at top-level
+        from fastmcp import FastMCP  # type: ignore
+    except Exception as e:  # pragma: no cover - import fallback message for runtime debugging
+        raise RuntimeError(
+            "FastMCP import failed. Install dependencies from requirements.txt. "
+            f"Original error: {e}"
+        ) from e
 
-# -----------------------------
-# Config
-# -----------------------------
-
-APP_NAME = "AuralMind Mastering MCP"
-HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "8000"))
-
-# Set AURALMIND_SCRIPT_PATH env var to the mastering script location.
-# Default is a relative path next to this server file.
-SCRIPT_PATH = Path(
-    os.getenv("AURALMIND_SCRIPT_PATH", "./auralmind_match_maestro_v7_3_expert1.py")
-).resolve()
-
-DATA_DIR = Path(os.getenv("AURALMIND_DATA_DIR", "./auralmind_data")).resolve()
-INBOX_DIR = DATA_DIR / "inbox"
-JOBS_DIR = DATA_DIR / "jobs"
-
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "250"))
-MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-
-# Public base URL is optional but helpful for returning absolute artifact links in tool responses.
-# Example: https://your-domain.com
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-
-# URL ingest hardening
-ALLOW_PRIVATE_URLS = os.getenv("ALLOW_PRIVATE_URLS", "0") == "1"
-URL_DOWNLOAD_TIMEOUT_CONNECT = float(os.getenv("URL_DOWNLOAD_TIMEOUT_CONNECT", "10"))
-URL_DOWNLOAD_TIMEOUT_READ = float(os.getenv("URL_DOWNLOAD_TIMEOUT_READ", "120"))
-
-# Job execution
-MAX_WORKERS = int(os.getenv("AURALMIND_MAX_WORKERS", "2"))
-
-ALLOWED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".aiff", ".aif", ".ogg", ".m4a"}
-
-for p in (INBOX_DIR, JOBS_DIR):
-    p.mkdir(parents=True, exist_ok=True)
+from auralmind_engine import AuralMindAdapter, EngineNotReadyError
 
 
-# -----------------------------
-# Utility helpers
-# -----------------------------
+# -------------------------------------------------------------------------
+# Logging / config helpers
+# -------------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+)
+log = logging.getLogger("auralmind_mcp")
+
+BASE_DIR = Path(__file__).resolve().parent
+SCRIPT_PATH = os.getenv(
+    "AURALMIND_SCRIPT_PATH",
+    str(BASE_DIR / "auralmind_engine" / "auralmind_match_maestro_v7_3_expert1.py"),
+)
+JOBS_DIR = Path(os.getenv("AURALMIND_JOBS_DIR", "/tmp/auralmind_jobs")).resolve()
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "200"))
+MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "250"))
+JOB_MAX_WORKERS = max(1, int(os.getenv("JOB_MAX_WORKERS", "2")))
+DEFAULT_PRESET = os.getenv("AURALMIND_DEFAULT_PRESET", "competitive_trap")
+ALLOW_LOCAL_FILES = os.getenv("ALLOW_LOCAL_FILES", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+_allowed_hosts_env = os.getenv("ALLOWED_DOWNLOAD_HOSTS", "").strip()
+ALLOWED_DOWNLOAD_HOSTS = {h.strip().lower() for h in _allowed_hosts_env.split(",") if h.strip()}
+
+PUBLIC_BASE_URL = os.getenv("MCP_PUBLIC_BASE_URL", "").rstrip("/")
+
 
 def _now_ts() -> float:
     return time.time()
 
 
-def _iso_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def _iso(ts: Optional[float] = None) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts or _now_ts()))
 
 
-def _safe_filename(name: str, default_stem: str = "audio") -> str:
-    name = (name or "").strip()
-    name = name.replace("\\", "/").split("/")[-1]
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
-    if not name:
-        name = f"{default_stem}.wav"
-    stem, ext = os.path.splitext(name)
-    if not ext:
-        ext = ".wav"
-    if ext.lower() not in ALLOWED_AUDIO_EXTS:
-        ext = ".wav"
-    stem = stem or default_stem
-    return f"{stem}{ext.lower()}"
+def _public_url(path: str) -> str:
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}{path}"
+    return path
 
 
-def _ensure_within(root: Path, candidate: Path) -> Path:
-    root = root.resolve()
-    candidate = candidate.resolve()
-    if root == candidate or root in candidate.parents:
-        return candidate
-    raise ValueError(f"Path escapes sandbox: {candidate}")
+# -------------------------------------------------------------------------
+# Security / file utilities
+# -------------------------------------------------------------------------
+def _ensure_private_path(p: Path, *, must_exist: bool = False) -> Path:
+    p = p.resolve()
+    try:
+        p.relative_to(JOBS_DIR)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Path escapes jobs directory")
+    if must_exist and not p.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return p
 
 
-def _public_url(path: str) -> Optional[str]:
-    if not PUBLIC_BASE_URL:
-        return None
-    # path should already start with /
-    return f"{PUBLIC_BASE_URL}{path}"
+def _safe_filename(name: str, fallback: str) -> str:
+    # Keep letters/digits/._- and collapse the rest.
+    import re
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (name or "").strip())
+    cleaned = cleaned.strip("._") or fallback
+    return cleaned[:180]
 
 
-def _is_blocked_ip(ip_str: str) -> bool:
-    ip = ipaddress.ip_address(ip_str)
-    return (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    )
-
-
-def _validate_url_for_download(url: str) -> str:
-    from urllib.parse import urlparse
-
+def _validate_remote_url(url: str) -> None:
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError("Only http/https URLs are allowed.")
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("Only http/https URLs are allowed")
     if not parsed.hostname:
-        raise ValueError("URL hostname is required.")
+        raise ValueError("URL must include a hostname")
+    host = parsed.hostname.lower()
 
-    if not ALLOW_PRIVATE_URLS:
-        try:
-            infos = socket.getaddrinfo(parsed.hostname, None, type=socket.SOCK_STREAM)
-            for info in infos:
-                ip = info[4][0]
-                if _is_blocked_ip(ip):
-                    raise ValueError(f"Blocked private/local address in URL resolution: {ip}")
-        except socket.gaierror as e:
-            raise ValueError(f"Failed to resolve URL host: {e}") from e
+    if ALLOWED_DOWNLOAD_HOSTS and host not in ALLOWED_DOWNLOAD_HOSTS:
+        raise ValueError(f"Host '{host}' is not in ALLOWED_DOWNLOAD_HOSTS")
 
-    return url
+    # Resolve DNS and block localhost/private/link-local/etc. (basic SSRF guard).
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise ValueError(f"DNS resolution failed for host '{host}': {e}") from e
+
+    for info in infos:
+        ip_str = info[4][0]
+        ip = ipaddress.ip_address(ip_str)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(f"Blocked URL target IP ({ip}); private/local addresses are not allowed")
 
 
-def _write_stream_to_file(resp: requests.Response, out_path: Path, max_bytes: int) -> int:
+def _stream_download_to_file(url: str, dest_path: Path, max_mb: int = MAX_DOWNLOAD_MB) -> dict[str, Any]:
+    _validate_remote_url(url)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    max_bytes = max_mb * 1024 * 1024
     total = 0
-    with out_path.open("wb") as f:
-        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+    headers: dict[str, str] = {"User-Agent": "AuralMindMCP/1.0"}
+    timeout = httpx.Timeout(20.0, connect=10.0, read=20.0, write=20.0)
+
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        with client.stream("GET", url, headers=headers) as resp:
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            if content_type and ("audio" not in content_type and "octet-stream" not in content_type):
+                log.warning("Remote file content-type is %s (continuing)", content_type)
+
+            with dest_path.open("wb") as f:
+                for chunk in resp.iter_bytes():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f"Downloaded file exceeds MAX_DOWNLOAD_MB ({max_mb} MB)")
+                    f.write(chunk)
+    return {"bytes": total, "path": str(dest_path)}
+
+
+async def _save_uploadfile(upload: UploadFile, dest: Path, max_mb: int = MAX_UPLOAD_MB) -> dict[str, Any]:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    max_bytes = max_mb * 1024 * 1024
+    total = 0
+    with dest.open("wb") as f:
+        while True:
+            chunk = await upload.read(1024 * 1024)
             if not chunk:
-                continue
+                break
             total += len(chunk)
             if total > max_bytes:
-                raise ValueError(f"File exceeds max size limit ({max_bytes} bytes).")
+                raise HTTPException(status_code=413, detail=f"Upload exceeds MAX_UPLOAD_MB ({max_mb} MB)")
             f.write(chunk)
-    return total
+    await upload.close()
+    return {"bytes": total, "path": str(dest)}
 
 
-# -----------------------------
-# AuralMind script dynamic loader
-# -----------------------------
-
-_AURALMIND_MOD = None
-_AURALMIND_LOCK = threading.Lock()
+# -------------------------------------------------------------------------
+# Engine + job models
+# -------------------------------------------------------------------------
+engine = AuralMindAdapter(SCRIPT_PATH)
 
 
-def get_auralmind_module():
+class TrapMasterIntent(BaseModel):
+    """High-level, LLM-friendly control surface for trap mastering recommendations."""
+    style: Literal["clean", "punchy", "wide", "dark", "aggressive", "radio-ready", "streaming"] = "punchy"
+    loudness_goal: Literal["safe_streaming", "competitive", "very_loud"] = "competitive"
+    brightness: int = Field(0, ge=-2, le=2, description="-2 darker, +2 brighter")
+    width: int = Field(0, ge=-2, le=2, description="-2 narrower, +2 wider")
+    punch: int = Field(1, ge=-2, le=2, description="-2 softer, +2 more punch")
+    sibilance_sensitivity: int = Field(0, ge=-2, le=2)
+    preserve_transients: bool = True
+    stem_separation: bool = False
+
+
+class StartJobInput(BaseModel):
+    """MCP tool input to create a mastering job.
+
+    Use one source mode:
+    - source_url (best for ChatGPT/remote workflows with pre-signed URLs)
+    - local_target_path (dev-only; requires ALLOW_LOCAL_FILES=true)
     """
-    Dynamically import the user's mastering script from SCRIPT_PATH.
-    """
-    global _AURALMIND_MOD
-    with _AURALMIND_LOCK:
-        if _AURALMIND_MOD is not None:
-            return _AURALMIND_MOD
-
-        if not SCRIPT_PATH.exists():
-            raise FileNotFoundError(f"AuralMind script not found: {SCRIPT_PATH}")
-
-        spec = importlib.util.spec_from_file_location("auralmind_user_script", str(SCRIPT_PATH))
-        if spec is None or spec.loader is None:
-            raise RuntimeError("Failed to create module spec for AuralMind script.")
-
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
-
-        missing = [name for name in ("get_presets", "master") if not hasattr(mod, name)]
-        if missing:
-            raise RuntimeError(f"AuralMind script missing required callables: {missing}")
-
-        _AURALMIND_MOD = mod
-        return mod
-
-
-def _preset_to_dict(preset_obj: Any) -> Dict[str, Any]:
-    if is_dataclass(preset_obj):
-        return asdict(preset_obj)
-    if hasattr(preset_obj, "__dict__"):
-        return dict(vars(preset_obj))
-    raise TypeError("Unsupported preset object type.")
-
-
-def _dump_model(model: BaseModel) -> Dict[str, Any]:
-    # Pydantic v2 / v1 compatibility helper
-    if hasattr(model, "model_dump"):
-        return model.model_dump(exclude_none=True)  # type: ignore[attr-defined]
-    return model.dict(exclude_none=True)  # type: ignore[attr-defined]
-
-
-# -----------------------------
-# File registry (ingested audio)
-# -----------------------------
-
-FILES_LOCK = threading.Lock()
-FILES: Dict[str, Dict[str, Any]] = {}  # audio_id -> metadata
-
-
-def _register_file(path: Path, original_name: str, source: str) -> str:
-    path = _ensure_within(DATA_DIR, path)
-    audio_id = uuid.uuid4().hex
-    meta = {
-        "audio_id": audio_id,
-        "path": str(path),
-        "original_name": original_name,
-        "source": source,
-        "created_at": _iso_now(),
-        "size_bytes": path.stat().st_size if path.exists() else None,
-    }
-    with FILES_LOCK:
-        FILES[audio_id] = meta
-    return audio_id
-
-
-def _resolve_audio_path(audio_id: Optional[str], explicit_path: Optional[str]) -> Optional[Path]:
-    if explicit_path:
-        p = Path(explicit_path).expanduser().resolve()
-        # We only allow explicit_path if it's inside DATA_DIR by default.
-        # If you want broader access during local dev, register it first via register_local_audio.
-        return _ensure_within(DATA_DIR, p)
-
-    if audio_id:
-        with FILES_LOCK:
-            meta = FILES.get(audio_id)
-        if not meta:
-            raise ValueError(f"Unknown audio_id: {audio_id}")
-        return _ensure_within(DATA_DIR, Path(meta["path"]))
-
-    return None
-
-
-# -----------------------------
-# Job models and state
-# -----------------------------
-
-class TrapProfile(BaseModel):
-    """
-    High-level user intent that ChatGPT can populate instead of guessing low-level DSP numbers.
-    """
-    loudness_style: Literal["streaming_clean", "competitive", "radio_loud"] = "competitive"
-    vibe: Literal["clean", "punchy", "dark", "airy", "warm"] = "punchy"
-    vocal_priority: Literal["high", "balanced", "low"] = "balanced"
-    bass_priority: Literal["tight", "big", "sub_heavy"] = "big"
-    preserve_dynamics: bool = True
-    notes: Optional[str] = None
-
-
-class PresetOverrides(BaseModel):
-    """
-    Safe subset of frequently useful overrides (mapped into dataclass replace()).
-    You can extend this list over time.
-    """
-    target_lufs: Optional[float] = Field(default=None, ge=-20.0, le=-6.0)
-    ceiling_dbfs: Optional[float] = Field(default=None, ge=-3.0, le=-0.1)
-
-    limiter_mode: Optional[Literal["v1", "v2"]] = None
-    enable_limiter: Optional[bool] = None
-    enable_softclip: Optional[bool] = None
-
-    enable_microdetail: Optional[bool] = None
-    microdetail_amount: Optional[float] = Field(default=None, ge=0.0, le=2.0)
-
-    enable_movement: Optional[bool] = None
-    movement_amount: Optional[float] = Field(default=None, ge=0.0, le=0.5)
-
-    enable_hooklift: Optional[bool] = None
-    hooklift_auto: Optional[bool] = None
-    hooklift_mix: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-
-    enable_stem_separation: Optional[bool] = None
-    demucs_device: Optional[Literal["cpu", "cuda"]] = None
-    demucs_overlap: Optional[float] = Field(default=None, ge=0.0, lt=1.0)
-    demucs_shifts: Optional[int] = Field(default=None, ge=1, le=8)
-
-    fir_streaming: Optional[Literal["auto", "on", "off"]] = None
-    fir_block_pow2: Optional[int] = Field(default=None, ge=12, le=20)
-
-    warmth: Optional[float] = Field(default=None, ge=-3.0, le=3.0)
-
-    transient_sculpt_boost_db: Optional[float] = Field(default=None, ge=0.0, le=8.0)
-    transient_sculpt_mix: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    transient_sculpt_crest_guard_db: Optional[float] = Field(default=None, ge=6.0, le=30.0)
-    transient_sculpt_decay_ms: Optional[float] = Field(default=None, ge=0.5, le=50.0)
-
-    # Escape hatch for future preset fields without changing schema every time
-    extra: Dict[str, Any] = Field(default_factory=dict)
-
-
-class MasteringRequest(BaseModel):
-    """
-    Main job request for the mastering engine.
-    """
-    source_audio_id: Optional[str] = None
-    source_path: Optional[str] = None
-
-    reference_audio_id: Optional[str] = None
-    reference_path: Optional[str] = None
-
-    preset_name: str = "hi_fi_streaming"
-    trap_profile: Optional[TrapProfile] = None
-    overrides: Optional[PresetOverrides] = None
-
-    output_basename: Optional[str] = None
-    write_report: bool = True
-
-    out_subtype: Optional[str] = None  # e.g. PCM_24
-    dither: Optional[bool] = None
+    source_url: Optional[str] = Field(default=None, description="HTTPS URL to target audio file (preferred in remote ChatGPT flows)")
+    local_target_path: Optional[str] = Field(default=None, description="Local file path for local development only")
+    reference_url: Optional[str] = None
+    local_reference_path: Optional[str] = None
+    preset: str = Field(default=DEFAULT_PRESET)
+    overrides: dict[str, Any] = Field(default_factory=dict, description="Validated preset field overrides (safe allowlist)")
     dither_seed: int = 0
-
-    # Use script-native auto tuning functions if available
-    use_script_auto_tune: bool = False
-
-    # Optional short user intent (good for audit trail)
-    user_goal: Optional[str] = None
+    notes_for_llm: Optional[str] = Field(default=None, description="Optional note/rationale to store alongside the job")
 
 
-class MasteringJobView(BaseModel):
+class JobStatusView(BaseModel):
     job_id: str
     status: Literal["queued", "running", "completed", "failed"]
     created_at: str
     updated_at: str
-    request: Dict[str, Any]
-    result: Optional[Dict[str, Any]] = None
+    preset: str
+    source: dict[str, Any]
+    reference: Optional[dict[str, Any]] = None
+    notes_for_llm: Optional[str] = None
+    overrides: dict[str, Any] = Field(default_factory=dict)
+    progress: dict[str, Any] = Field(default_factory=dict)
+    result: Optional[dict[str, Any]] = None
     error: Optional[str] = None
-    report_excerpt: Optional[str] = None
-    artifacts: Dict[str, Any] = Field(default_factory=dict)
+    artifacts: dict[str, Any] = Field(default_factory=dict)
 
 
-JOBS_LOCK = threading.Lock()
-JOBS: Dict[str, Dict[str, Any]] = {}
-EXECUTOR = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+class JobRecord:
+    def __init__(self, *, job_id: str, source: dict[str, Any], reference: Optional[dict[str, Any]], preset: str, overrides: dict[str, Any], notes_for_llm: Optional[str]):
+        now = _now_ts()
+        self.job_id = job_id
+        self.status: str = "queued"
+        self.created_ts = now
+        self.updated_ts = now
+        self.preset = preset
+        self.source = source
+        self.reference = reference
+        self.overrides = overrides
+        self.notes_for_llm = notes_for_llm
+        self.progress: dict[str, Any] = {}
+        self.result: Optional[dict[str, Any]] = None
+        self.error: Optional[str] = None
+        self.paths: dict[str, str] = {}
 
+    def touch(self):
+        self.updated_ts = _now_ts()
 
-def _update_job(job_id: str, **updates: Any) -> None:
-    with JOBS_LOCK:
-        job = JOBS[job_id]
-        job.update(updates)
-        job["updated_at"] = _iso_now()
-
-
-def _create_job_record(req: MasteringRequest) -> str:
-    job_id = uuid.uuid4().hex
-    now = _iso_now()
-    with JOBS_LOCK:
-        JOBS[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "created_at": now,
-            "updated_at": now,
-            "request": _dump_model(req),
-            "result": None,
-            "error": None,
-            "report_excerpt": None,
-            "artifacts": {},
-        }
-    return job_id
-
-
-def _recommend_trap_params(profile: TrapProfile) -> Dict[str, Any]:
-    """
-    Deterministic server-side helper.
-    ChatGPT can call this tool and then still adjust values based on taste.
-    """
-    preset_name = "hi_fi_streaming"
-    updates: Dict[str, Any] = {}
-
-    if profile.loudness_style == "radio_loud":
-        preset_name = "radio_loud"
-    elif profile.loudness_style == "competitive":
-        preset_name = "radio_loud"
-        updates["target_lufs"] = -10.8 if not profile.preserve_dynamics else -11.4
-        updates["ceiling_dbfs"] = -1.0
-    else:  # streaming_clean
-        preset_name = "hi_fi_streaming"
-        updates["target_lufs"] = -12.5
-        updates["ceiling_dbfs"] = -1.0
-
-    # Vibe shaping
-    if profile.vibe == "punchy":
-        updates["transient_sculpt_mix"] = 0.42
-        updates["transient_sculpt_boost_db"] = 2.8
-        updates["enable_softclip"] = True
-    elif profile.vibe == "airy":
-        updates["enable_microdetail"] = True
-        updates["microdetail_amount"] = 0.22
-        updates["warmth"] = -0.2
-    elif profile.vibe == "warm":
-        updates["warmth"] = 0.6
-        updates["microdetail_amount"] = 0.14
-    elif profile.vibe == "dark":
-        updates["microdetail_amount"] = 0.10
-        updates["warmth"] = 0.4
-
-    # Bass / movement / hook lift
-    if profile.bass_priority == "sub_heavy":
-        updates["enable_hooklift"] = True
-        updates["hooklift_auto"] = True
-        updates["hooklift_mix"] = 0.24
-    elif profile.bass_priority == "tight":
-        updates["hooklift_mix"] = 0.12
-        updates["transient_sculpt_crest_guard_db"] = 18.5
-
-    if profile.vocal_priority == "high":
-        updates["enable_microdetail"] = True
-        updates["movement_amount"] = 0.08
-    elif profile.vocal_priority == "low":
-        updates["movement_amount"] = 0.12
-
-    if profile.preserve_dynamics:
-        # Loosen loudness aggression slightly
-        updates.setdefault("target_lufs", -11.8 if preset_name == "radio_loud" else -12.6)
-
-    return {
-        "preset_name": preset_name,
-        "overrides": updates,
-        "rationale": {
-            "loudness_style": profile.loudness_style,
-            "vibe": profile.vibe,
-            "vocal_priority": profile.vocal_priority,
-            "bass_priority": profile.bass_priority,
-            "preserve_dynamics": profile.preserve_dynamics,
-            "notes": profile.notes,
-        },
-    }
-
-
-def _apply_overrides_to_preset(mod: Any, preset_obj: Any, overrides: Optional[PresetOverrides]) -> Any:
-    if overrides is None:
-        return preset_obj
-
-    raw = _dump_model(overrides)
-    extra = raw.pop("extra", {}) or {}
-    updates = {k: v for k, v in raw.items() if v is not None}
-    updates.update(extra)
-
-    if not updates:
-        return preset_obj
-
-    # replace() works with dataclass Preset instances
-    try:
-        return replace(preset_obj, **updates)
-    except TypeError as e:
-        # Return a cleaner error for model/tool layer
-        raise ValueError(f"Invalid preset override keys/values: {e}") from e
-
-
-def _maybe_script_auto_tune(mod: Any, preset_obj: Any, target_path: Path, reference_path: Optional[Path]) -> Any:
-    """
-    If your script exposes auto-tune helpers (as hinted in its CLI flow), use them.
-    Otherwise no-op.
-    """
-    needed = ("load_audio", "analyze_track_features", "auto_select_preset_name", "auto_tune_preset")
-    if not all(hasattr(mod, n) for n in needed):
-        return preset_obj
-
-    try:
-        y_t, sr_t = mod.load_audio(str(target_path))
-        tf = mod.analyze_track_features(y_t, sr_t)
-        rf = None
-
-        if reference_path:
-            y_r, sr_r = mod.load_audio(str(reference_path))
-            rf = mod.analyze_track_features(y_r, sr_r)
-
-        presets = mod.get_presets()
-        selected_name = mod.auto_select_preset_name(tf)
-        candidate = presets.get(selected_name, preset_obj)
-        tuned_preset, _auto_info = mod.auto_tune_preset(candidate, tf, rf)
-        return tuned_preset
-    except Exception:
-        # Fail soft; the main mastering should still proceed
-        return preset_obj
-
-
-def _read_report_excerpt(report_path: Path, max_chars: int = 4000) -> Optional[str]:
-    if not report_path.exists():
-        return None
-    try:
-        txt = report_path.read_text(encoding="utf-8", errors="replace")
-        return txt[:max_chars]
-    except Exception:
-        return None
-
-
-def _run_mastering_job(job_id: str, req_dict: Dict[str, Any]) -> None:
-    _update_job(job_id, status="running")
-
-    try:
-        mod = get_auralmind_module()
-        req = MasteringRequest(**req_dict)
-
-        source_path = _resolve_audio_path(req.source_audio_id, req.source_path)
-        if source_path is None:
-            raise ValueError("source_audio_id or source_path is required.")
-
-        reference_path = _resolve_audio_path(req.reference_audio_id, req.reference_path)
-
-        if not source_path.exists():
-            raise FileNotFoundError(f"Source audio not found: {source_path}")
-        if reference_path and not reference_path.exists():
-            raise FileNotFoundError(f"Reference audio not found: {reference_path}")
-
-        presets = mod.get_presets()
-        if req.preset_name not in presets:
-            raise ValueError(
-                f"Unknown preset_name '{req.preset_name}'. Available: {sorted(list(presets.keys()))}"
-            )
-        preset_obj = presets[req.preset_name]
-
-        # Optional server-side recommendation override
-        recommendation_applied = None
-        if req.trap_profile is not None:
-            rec = _recommend_trap_params(req.trap_profile)
-            recommendation_applied = rec
-
-            # Switch preset if needed and available
-            rec_preset_name = rec["preset_name"]
-            if rec_preset_name in presets:
-                preset_obj = presets[rec_preset_name]
-
-            # Merge recommended updates into overrides (user overrides win)
-            rec_overrides = PresetOverrides(extra=rec["overrides"])
-            preset_obj = _apply_overrides_to_preset(mod, preset_obj, rec_overrides)
-
-        # Optional script-native auto tune (if script exposes those helpers)
-        if req.use_script_auto_tune:
-            preset_obj = _maybe_script_auto_tune(mod, preset_obj, source_path, reference_path)
-
-        # Final user overrides win last
-        preset_obj = _apply_overrides_to_preset(mod, preset_obj, req.overrides)
-
-        job_dir = _ensure_within(JOBS_DIR, (JOBS_DIR / job_id))
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        base = req.output_basename or Path(source_path).stem + "_master"
-        base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._") or "master"
-        out_path = job_dir / f"{base}.wav"
-        report_path = job_dir / f"{base}.md"
-
-        result = mod.master(
-            target_path=str(source_path),
-            out_path=str(out_path),
-            preset=preset_obj,
-            reference_path=str(reference_path) if reference_path else None,
-            report_path=str(report_path) if req.write_report else None,
-            out_subtype=req.out_subtype,
-            dither=req.dither,
-            dither_seed=int(req.dither_seed),
+    def to_view(self) -> JobStatusView:
+        return JobStatusView(
+            job_id=self.job_id,
+            status=self.status,  # type: ignore[arg-type]
+            created_at=_iso(self.created_ts),
+            updated_at=_iso(self.updated_ts),
+            preset=self.preset,
+            source=self.source,
+            reference=self.reference,
+            notes_for_llm=self.notes_for_llm,
+            overrides=self.overrides,
+            progress=self.progress,
+            result=self.result,
+            error=self.error,
+            artifacts=self._artifact_view(),
         )
 
-        artifacts = {
-            "job_dir": str(job_dir),
-            "master_wav_path": str(out_path) if out_path.exists() else None,
-            "report_path": str(report_path) if report_path.exists() else None,
-            "master_wav_download_url": _public_url(f"/download/{job_id}/master"),
-            "report_download_url": _public_url(f"/download/{job_id}/report"),
-        }
+    def _artifact_view(self) -> dict[str, Any]:
+        out = {}
+        if "mastered_audio" in self.paths:
+            out["mastered_audio_url"] = _public_url(f"/api/jobs/{self.job_id}/download")
+        if "report_md" in self.paths and Path(self.paths["report_md"]).exists():
+            out["report_url"] = _public_url(f"/api/jobs/{self.job_id}/report")
+        if "result_json" in self.paths and Path(self.paths["result_json"]).exists():
+            out["result_json_url"] = _public_url(f"/api/jobs/{self.job_id}/result.json")
+        return out
 
-        # Attach recommendation audit if used
-        if recommendation_applied:
-            if is_dataclass(result) and not isinstance(result, type):
-                result = asdict(result)
-            elif not isinstance(result, dict):
-                result = {"raw_result": str(result)}
+
+class JobManager:
+    def __init__(self, *, jobs_dir: Path, engine_adapter: AuralMindAdapter, max_workers: int = 2):
+        self.jobs_dir = jobs_dir
+        self.engine = engine_adapter
+        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="master-job")
+        self._jobs: dict[str, JobRecord] = {}
+        self._lock = threading.Lock()
+
+    def _job_dir(self, job_id: str) -> Path:
+        d = (self.jobs_dir / job_id).resolve()
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def get(self, job_id: str) -> JobRecord:
+        with self._lock:
+            job = self._jobs.get(job_id)
+        if not job:
+            raise KeyError(job_id)
+        return job
+
+    def list_recent(self, limit: int = 20) -> list[JobStatusView]:
+        with self._lock:
+            jobs = list(self._jobs.values())
+        jobs.sort(key=lambda j: j.created_ts, reverse=True)
+        return [j.to_view() for j in jobs[:max(1, min(limit, 100))]]
+
+    def submit(
+        self,
+        *,
+        source: dict[str, Any],
+        reference: Optional[dict[str, Any]],
+        preset: str,
+        overrides: dict[str, Any],
+        notes_for_llm: Optional[str] = None,
+        dither_seed: int = 0,
+    ) -> JobStatusView:
+        job_id = uuid.uuid4().hex
+        job = JobRecord(
+            job_id=job_id,
+            source=source,
+            reference=reference,
+            preset=preset,
+            overrides=overrides,
+            notes_for_llm=notes_for_llm,
+        )
+        with self._lock:
+            self._jobs[job_id] = job
+
+        self.executor.submit(self._run_job, job_id, dither_seed)
+        return job.to_view()
+
+    def _persist_json(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+    def _run_job(self, job_id: str, dither_seed: int) -> None:
+        job = self.get(job_id)
+        job_dir = self._job_dir(job_id)
+        source_audio = job_dir / "input_target.wav"
+        reference_audio: Optional[Path] = None
+        out_audio = job_dir / "mastered.wav"
+        report_md = job_dir / "report.md"
+        result_json = job_dir / "result.json"
+
+        def set_status(status: str, **progress: Any) -> None:
+            job.status = status
+            if progress:
+                job.progress.update(progress)
+            job.touch()
+            self._persist_json(job_dir / "job_status.json", job.to_view().model_dump())
+
+        try:
+            set_status("running", stage="preparing_inputs")
+
+            # Ingestion
+            src_mode = job.source.get("mode")
+            if src_mode == "url":
+                src_url = str(job.source["url"])
+                src_name = _safe_filename(job.source.get("filename") or "target.wav", "target.wav")
+                source_audio = job_dir / src_name
+                _stream_download_to_file(src_url, source_audio)
+                job.source["stored_path"] = str(source_audio)
+            elif src_mode == "local_path":
+                src = Path(str(job.source["path"])).expanduser().resolve()
+                if not ALLOW_LOCAL_FILES:
+                    raise PermissionError("Local file mode is disabled (ALLOW_LOCAL_FILES=false)")
+                if not src.exists():
+                    raise FileNotFoundError(f"Target file not found: {src}")
+                shutil.copy2(src, source_audio)
+                job.source["stored_path"] = str(source_audio)
             else:
-                result = dict(result)
-            result["trap_recommendation_applied"] = recommendation_applied
+                raise ValueError(f"Unsupported source mode: {src_mode!r}")
 
-        report_excerpt = _read_report_excerpt(report_path) if req.write_report else None
-        _update_job(
-            job_id,
-            status="completed",
-            result=result,
-            artifacts=artifacts,
-            report_excerpt=report_excerpt,
-        )
+            if job.reference:
+                ref_mode = job.reference.get("mode")
+                if ref_mode == "url":
+                    ref_name = _safe_filename(job.reference.get("filename") or "reference.wav", "reference.wav")
+                    reference_audio = job_dir / ref_name
+                    _stream_download_to_file(str(job.reference["url"]), reference_audio)
+                    job.reference["stored_path"] = str(reference_audio)
+                elif ref_mode == "local_path":
+                    ref_src = Path(str(job.reference["path"])).expanduser().resolve()
+                    if not ALLOW_LOCAL_FILES:
+                        raise PermissionError("Local reference mode disabled (ALLOW_LOCAL_FILES=false)")
+                    if not ref_src.exists():
+                        raise FileNotFoundError(f"Reference file not found: {ref_src}")
+                    reference_audio = job_dir / "reference.wav"
+                    shutil.copy2(ref_src, reference_audio)
+                    job.reference["stored_path"] = str(reference_audio)
+                else:
+                    raise ValueError(f"Unsupported reference mode: {ref_mode!r}")
 
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-        tb = traceback.format_exc(limit=20)
-        _update_job(job_id, status="failed", error=f"{err}\n\n{tb}")
+            set_status("running", stage="mastering", message="Running AuralMind engine")
+
+            result = self.engine.run_master(
+                target_path=str(source_audio),
+                out_path=str(out_audio),
+                preset_name=job.preset,
+                reference_path=str(reference_audio) if reference_audio else None,
+                report_path=str(report_md),
+                overrides=job.overrides,
+                dither_seed=int(dither_seed),
+            )
+
+            job.result = result
+            job.paths["mastered_audio"] = str(out_audio)
+            if report_md.exists():
+                job.paths["report_md"] = str(report_md)
+            self._persist_json(result_json, result)
+            job.paths["result_json"] = str(result_json)
+
+            set_status("completed", stage="done")
+        except Exception as e:
+            log.exception("Job %s failed", job_id)
+            job.error = f"{type(e).__name__}: {e}"
+            set_status("failed", stage="failed")
 
 
-# -----------------------------
-# MCP tool schemas (analysis / ingestion)
-# -----------------------------
-
-class UrlIngestRequest(BaseModel):
-    url: str
-    filename_hint: Optional[str] = None
+jobs = JobManager(jobs_dir=JOBS_DIR, engine_adapter=engine, max_workers=JOB_MAX_WORKERS)
 
 
-class LocalRegisterRequest(BaseModel):
+# -------------------------------------------------------------------------
+# LLM helper logic (rule-based presets for trap mastering)
+# -------------------------------------------------------------------------
+def recommend_trap_overrides(intent: TrapMasterIntent) -> dict[str, Any]:
+    """Simple deterministic mapper the LLM can call before starting a job.
+
+    ChatGPT (the brain) can use this as a *baseline*, then edit the returned overrides.
     """
-    Register a local file path already placed inside AURALMIND_DATA_DIR.
-    Safer than allowing arbitrary filesystem reads.
-    """
-    path: str
-    label: Optional[str] = None
+    preset = "competitive_trap"
+    if intent.loudness_goal == "safe_streaming":
+        preset = "hi_fi_streaming"
+    elif intent.style in {"radio-ready"}:
+        preset = "radio_loud"
+    elif intent.style in {"clean", "wide"}:
+        preset = "club_clean"
 
-
-class AnalyzeAudioRequest(BaseModel):
-    audio_id: Optional[str] = None
-    path: Optional[str] = None
-
-
-class JobIdRequest(BaseModel):
-    job_id: str
-
-
-class ReportReadRequest(BaseModel):
-    job_id: str
-    max_chars: int = Field(default=12000, ge=1000, le=100000)
-
-
-class TrapRecommendationRequest(BaseModel):
-    profile: TrapProfile
-
-
-# -----------------------------
-# Build MCP server
-# -----------------------------
-
-mcp = FastMCP(APP_NAME)
-
-@mcp.tool()
-def server_info() -> Dict[str, Any]:
-    """
-    Returns server/runtime info and whether the AuralMind script was loaded successfully.
-    ChatGPT should call this early in a session before mastering.
-    """
-    info: Dict[str, Any] = {
-        "server": APP_NAME,
-        "script_path": str(SCRIPT_PATH),
-        "data_dir": str(DATA_DIR),
-        "inbox_dir": str(INBOX_DIR),
-        "jobs_dir": str(JOBS_DIR),
-        "max_upload_mb": MAX_UPLOAD_MB,
-        "public_base_url": PUBLIC_BASE_URL or None,
-        "time_utc": _iso_now(),
-    }
-    try:
-        mod = get_auralmind_module()
-        presets = mod.get_presets()
-        info["script_loaded"] = True
-        info["preset_count"] = len(presets)
-        info["presets"] = sorted(list(presets.keys()))
-    except Exception as e:
-        info["script_loaded"] = False
-        info["error"] = f"{type(e).__name__}: {e}"
-    return info
-
-
-@mcp.tool()
-def list_presets() -> Dict[str, Any]:
-    """
-    List preset names and their current defaults from the AuralMind script.
-    """
-    mod = get_auralmind_module()
-    presets = mod.get_presets()
-    return {
-        "preset_names": sorted(list(presets.keys())),
-        "presets": {name: _preset_to_dict(obj) for name, obj in presets.items()},
+    overrides: dict[str, Any] = {
+        "enable_stem_separation": bool(intent.stem_separation),
+        "enable_transient_sculpt": bool(intent.preserve_transients),
+        "target_lufs": -10.5 if intent.loudness_goal == "competitive" else (-12.8 if intent.loudness_goal == "safe_streaming" else -9.3),
+        "softclip_mix": 0.22,
+        "softclip_drive_db": 1.2,
+        "microdetail_mix": 0.55,
+        "hooklift_auto": True,
+        "hooklift_mix": 0.22,
+        "movement_amount": 0.10,
+        "enable_movement": True,
+        "governor_gr_limit_db": -2.0 if intent.loudness_goal != "very_loud" else -3.5,
+        "out_subtype": "PCM_24",
+        "dither": True,
     }
 
+    # Brightness / width / punch shaping
+    overrides["glow_mix"] = round(min(1.0, max(0.0, 0.48 + (0.08 * intent.brightness))), 3)
+    overrides["deess_mix"] = round(min(1.0, max(0.0, 0.48 + (0.10 * intent.sibilance_sensitivity))), 3)
+    overrides["width_hi"] = round(min(1.45, max(0.95, 1.18 + (0.08 * intent.width))), 3)
+    overrides["width_mid"] = round(min(1.18, max(0.92, 1.03 + (0.03 * intent.width))), 3)
+    overrides["microshift_mix"] = round(min(0.35, max(0.0, 0.12 + (0.04 * max(0, intent.width)))), 3)
 
-@mcp.tool()
-def recommend_trap_mastering(req: TrapRecommendationRequest) -> Dict[str, Any]:
-    """
-    Deterministic recommendation helper for trap masters.
-    ChatGPT can call this, then refine values based on user feedback and rerun mastering.
-    """
-    return _recommend_trap_params(req.profile)
-
-
-@mcp.tool()
-def register_local_audio(req: LocalRegisterRequest) -> Dict[str, Any]:
-    """
-    Register an audio file already present under AURALMIND_DATA_DIR (sandboxed).
-    Useful for local/dev workflows.
-    """
-    p = _ensure_within(DATA_DIR, Path(req.path).resolve())
-    if not p.exists():
-        raise FileNotFoundError(f"File not found: {p}")
-    if p.suffix.lower() not in ALLOWED_AUDIO_EXTS:
-        raise ValueError(f"Unsupported audio extension: {p.suffix}")
-    audio_id = _register_file(p, req.label or p.name, source="local_registered")
-    return {"audio_id": audio_id, "path": str(p), "name": p.name, "size_bytes": p.stat().st_size}
-
-
-@mcp.tool()
-def ingest_audio_from_url(req: UrlIngestRequest) -> Dict[str, Any]:
-    """
-    Download audio from a URL into the server inbox and register it as an audio_id.
-    Includes basic SSRF protections and size limits.
-    """
-    url = _validate_url_for_download(req.url)
-    filename = _safe_filename(req.filename_hint or Path(req.url.split("?")[0]).name or "download.wav")
-
-    inbox_name = f"{uuid.uuid4().hex}_{filename}"
-    out_path = _ensure_within(INBOX_DIR, INBOX_DIR / inbox_name)
-
-    with requests.get(
-        url,
-        stream=True,
-        timeout=(URL_DOWNLOAD_TIMEOUT_CONNECT, URL_DOWNLOAD_TIMEOUT_READ),
-        allow_redirects=True,
-    ) as resp:
-        resp.raise_for_status()
-
-        # Recheck redirect target host
-        _validate_url_for_download(resp.url)
-
-        # Optional lightweight content-type check
-        ctype = (resp.headers.get("content-type") or "").lower()
-        if ctype and not any(x in ctype for x in ("audio", "octet-stream", "mpeg", "mp4")):
-            # Don't hard-fail because some hosts mislabel; continue but note it.
-            pass
-
-        total = _write_stream_to_file(resp, out_path, MAX_UPLOAD_BYTES)
-
-    audio_id = _register_file(out_path, filename, source="url_ingest")
-    return {
-        "audio_id": audio_id,
-        "stored_path": str(out_path),
-        "original_name": filename,
-        "size_bytes": total,
+    punch_map = {
+        -2: (0.10, 0.4, 0.18),
+        -1: (0.16, 0.8, 0.22),
+         0: (0.22, 1.2, 0.26),
+         1: (0.28, 1.8, 0.32),
+         2: (0.34, 2.4, 0.38),
     }
+    t_mix, t_boost, md_amount = punch_map[int(intent.punch)]
+    overrides["transient_sculpt_mix"] = t_mix
+    overrides["transient_sculpt_boost_db"] = t_boost
+    overrides["microdetail_amount"] = md_amount
 
+    if intent.style == "dark":
+        overrides["warmth"] = 0.35
+        overrides["glow_mix"] = round(max(0.0, overrides["glow_mix"] - 0.15), 3)
+    elif intent.style == "wide":
+        overrides["width_hi"] = min(1.5, float(overrides["width_hi"]) + 0.08)
+        overrides["width_mid"] = min(1.2, float(overrides["width_mid"]) + 0.03)
+    elif intent.style == "aggressive":
+        overrides["target_lufs"] = max(-9.0, float(overrides["target_lufs"]))
+        overrides["softclip_drive_db"] = min(4.0, float(overrides["softclip_drive_db"]) + 0.7)
+        overrides["governor_gr_limit_db"] = -3.2
 
-@mcp.tool()
-def analyze_audio(req: AnalyzeAudioRequest) -> Dict[str, Any]:
-    """
-    Quick audio analysis for planning mastering parameters.
-    Uses soundfile for portable metadata and, if available, AuralMind helper metrics.
-    """
-    p = _resolve_audio_path(req.audio_id, req.path)
-    if p is None:
-        raise ValueError("Provide audio_id or path.")
-    if not p.exists():
-        raise FileNotFoundError(f"Audio not found: {p}")
-
-    info = sf.info(str(p))
-    duration = float(info.frames / info.samplerate) if info.samplerate else None
-
-    out: Dict[str, Any] = {
-        "path": str(p),
-        "format": getattr(info, "format", None),
-        "subtype": getattr(info, "subtype", None),
-        "sample_rate": getattr(info, "samplerate", None),
-        "channels": getattr(info, "channels", None),
-        "frames": getattr(info, "frames", None),
-        "duration_sec": duration,
-    }
-
-    # Optional deeper analysis via AuralMind script helpers, if exposed
-    try:
-        mod = get_auralmind_module()
-        if all(hasattr(mod, n) for n in ("load_audio", "integrated_loudness_lufs")):
-            y, sr = mod.load_audio(str(p))
-            if hasattr(mod, "ensure_stereo"):
-                y = mod.ensure_stereo(y)
-
-            out["auralmind_sample_rate"] = int(sr)
-            out["lufs_integrated"] = float(mod.integrated_loudness_lufs(y, sr))
-
-            if all(hasattr(mod, n) for n in ("true_peak_estimate", "lin_to_db")):
-                tp_lin = mod.true_peak_estimate(y, sr, oversample=4)
-                out["true_peak_dbfs_est"] = float(mod.lin_to_db(tp_lin + 1e-12))
-
-            if hasattr(mod, "analyze_track_features"):
-                try:
-                    feats = mod.analyze_track_features(y, sr)
-                    # Convert to plain JSON-safe values where possible
-                    if isinstance(feats, dict):
-                        clean = {}
-                        for k, v in feats.items():
-                            try:
-                                clean[k] = float(v) if isinstance(v, (int, float)) else v
-                            except Exception:
-                                clean[k] = str(v)
-                        out["track_features"] = clean
-                    else:
-                        out["track_features"] = str(feats)
-                except Exception as e:
-                    out["track_features_error"] = f"{type(e).__name__}: {e}"
-    except Exception as e:
-        out["auralmind_analysis_error"] = f"{type(e).__name__}: {e}"
-
-    return out
-
-
-@mcp.tool()
-def start_mastering_job(req: MasteringRequest) -> Dict[str, Any]:
-    """
-    Queue a mastering job.
-    Recommended ChatGPT flow:
-    1) analyze_audio
-    2) recommend_trap_mastering (optional)
-    3) start_mastering_job
-    4) get_mastering_job_status until completed
-    5) read_mastering_report / fetch artifacts
-    """
-    if not req.source_audio_id and not req.source_path:
-        raise ValueError("source_audio_id or source_path is required")
-
-    job_id = _create_job_record(req)
-    EXECUTOR.submit(_run_mastering_job, job_id, _dump_model(req))
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "poll_with": "get_mastering_job_status",
-        "hint": "Poll every few seconds. Use read_mastering_report when completed.",
-    }
-
-
-@mcp.tool()
-def get_mastering_job_status(req: JobIdRequest) -> Dict[str, Any]:
-    """
-    Poll job status and receive result/error/artifact metadata.
-    """
-    with JOBS_LOCK:
-        job = JOBS.get(req.job_id)
-        if not job:
-            raise ValueError(f"Unknown job_id: {req.job_id}")
-        return dict(job)
-
-
-@mcp.tool()
-def read_mastering_report(req: ReportReadRequest) -> Dict[str, Any]:
-    """
-    Read the generated markdown report (truncated) for a completed job.
-    """
-    with JOBS_LOCK:
-        job = JOBS.get(req.job_id)
-        if not job:
-            raise ValueError(f"Unknown job_id: {req.job_id}")
-
-    artifacts = job.get("artifacts") or {}
-    report_path = artifacts.get("report_path")
-    if not report_path:
-        raise ValueError("No report artifact found for this job.")
-    rp = _ensure_within(JOBS_DIR, Path(report_path))
-    if not rp.exists():
-        raise FileNotFoundError(f"Report not found: {rp}")
-
-    txt = rp.read_text(encoding="utf-8", errors="replace")
-    return {
-        "job_id": req.job_id,
-        "report_path": str(rp),
-        "report_text": txt[: req.max_chars],
-        "truncated": len(txt) > req.max_chars,
-    }
-
-
-@mcp.tool()
-def list_artifacts(req: JobIdRequest) -> Dict[str, Any]:
-    """
-    Return artifact paths and optional download URLs for a job.
-    """
-    with JOBS_LOCK:
-        job = JOBS.get(req.job_id)
-        if not job:
-            raise ValueError(f"Unknown job_id: {req.job_id}")
-    return {
-        "job_id": req.job_id,
-        "status": job["status"],
-        "artifacts": job.get("artifacts") or {},
-    }
-
-
-# -----------------------------
-# REST helper app (upload/download/health)
-# -----------------------------
-
-app = FastAPI(title=APP_NAME)
-
-# Optional CORS for your own frontend; tighten in production
-try:
-    from fastapi.middleware.cors import CORSMiddleware
-
-    allow_origins = [
-        o.strip() for o in os.getenv("ALLOW_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")
-        if o.strip()
+    rationale = [
+        f"Base preset selected: {preset}",
+        "Transient sculpt + movement/hooklift enabled for trap energy and perceived motion.",
+        "Governor ceiling kept within a quality-first range to avoid crushed masters.",
+        "Output defaults to PCM_24 + dither=true for portable deliverables.",
     ]
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allow_origins,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-except Exception:
-    pass
+    return {"preset": preset, "overrides": overrides, "rationale": rationale}
 
 
-@app.get("/api/health")
-def health() -> Dict[str, Any]:
-    script_ok = True
-    script_err = None
+# -------------------------------------------------------------------------
+# MCP tool schemas (define Pydantic models before decorators)
+# -------------------------------------------------------------------------
+class PresetLookupInput(BaseModel):
+    preset: str
+
+
+class JobLookupInput(BaseModel):
+    job_id: str
+
+
+class RecentJobsInput(BaseModel):
+    limit: int = Field(default=10, ge=1, le=50)
+
+
+# -------------------------------------------------------------------------
+# FastMCP tools
+# -------------------------------------------------------------------------
+mcp = FastMCP("AuralMind Mastering Server")
+
+@mcp.tool(
+    name="server_health",
+    description="Check server + AuralMind engine readiness. Use this first if tools fail or after deploy."
+)
+def server_health() -> dict[str, Any]:
     try:
-        get_auralmind_module()
+        info = engine.reload() if os.getenv("ENGINE_RELOAD_ON_HEALTH", "false").lower() in {"1","true","yes"} else {
+            "script_path": SCRIPT_PATH,
+            "preset_count": len(engine.get_preset_names()),
+        }
+        return {
+            "ok": True,
+            "time": _iso(),
+            "jobs_dir": str(JOBS_DIR),
+            "default_preset": DEFAULT_PRESET,
+            "allow_local_files": ALLOW_LOCAL_FILES,
+            "max_upload_mb": MAX_UPLOAD_MB,
+            "max_download_mb": MAX_DOWNLOAD_MB,
+            "engine": info,
+        }
+    except EngineNotReadyError as e:
+        return {"ok": False, "time": _iso(), "error": str(e)}
+
+@mcp.tool(
+    name="list_presets",
+    description="List AuralMind preset names and a compact summary. Use before starting a mastering job."
+)
+def list_presets() -> dict[str, Any]:
+    presets = engine.get_presets()
+    compact = {}
+    for name, p in presets.items():
+        compact[name] = {
+            "target_lufs": p.get("target_lufs"),
+            "ceiling_dbfs": p.get("ceiling_dbfs"),
+            "sr": p.get("sr"),
+            "enable_stem_separation": p.get("enable_stem_separation"),
+        }
+    return {"preset_count": len(compact), "presets": compact}
+
+@mcp.tool(
+    name="get_preset",
+    description="Return full preset fields. Use this when planning precise overrides."
+)
+def get_preset(payload: PresetLookupInput) -> dict[str, Any]:
+    return {"preset": payload.preset, "details": engine.get_preset_details(payload.preset)}
+
+@mcp.tool(
+    name="plan_trap_master",
+    description=(
+        "Create a trap-mastering starting plan (preset + safe overrides) from high-level intent. "
+        "Use this before start_master_job when the user describes a vibe like punchy/wide/dark."
+    )
+)
+def plan_trap_master(payload: TrapMasterIntent) -> dict[str, Any]:
+    return recommend_trap_overrides(payload)
+
+@mcp.tool(
+    name="start_master_job",
+    description=(
+        "Queue a mastering job. Prefer source_url/reference_url in remote ChatGPT flows "
+        "(e.g., presigned HTTPS links). local_target_path only works when ALLOW_LOCAL_FILES=true."
+    )
+)
+def start_master_job(payload: StartJobInput) -> dict[str, Any]:
+    if not payload.source_url and not payload.local_target_path:
+        raise ValueError("Provide either source_url or local_target_path")
+
+    if payload.source_url and payload.local_target_path:
+        raise ValueError("Provide only one of source_url or local_target_path")
+
+    if payload.reference_url and payload.local_reference_path:
+        raise ValueError("Provide only one of reference_url or local_reference_path")
+
+    source: dict[str, Any]
+    if payload.source_url:
+        source = {"mode": "url", "url": payload.source_url}
+    else:
+        source = {"mode": "local_path", "path": payload.local_target_path}
+
+    reference: Optional[dict[str, Any]] = None
+    if payload.reference_url:
+        reference = {"mode": "url", "url": payload.reference_url}
+    elif payload.local_reference_path:
+        reference = {"mode": "local_path", "path": payload.local_reference_path}
+
+    # Validate overrides up front so the LLM gets immediate feedback.
+    engine.validate_overrides(payload.overrides)
+    engine.split_virtual_master_args(payload.overrides)
+
+    view = jobs.submit(
+        source=source,
+        reference=reference,
+        preset=payload.preset,
+        overrides=payload.overrides,
+        notes_for_llm=payload.notes_for_llm,
+        dither_seed=payload.dither_seed,
+    )
+    return {
+        "job": view.model_dump(),
+        "next_step": "Call get_job_status with the returned job_id until status is completed or failed."
+    }
+
+@mcp.tool(
+    name="get_job_status",
+    description="Poll job status. Use repeatedly after start_master_job until terminal status."
+)
+def get_job_status(payload: JobLookupInput) -> dict[str, Any]:
+    return jobs.get(payload.job_id).to_view().model_dump()
+
+@mcp.tool(
+    name="list_recent_jobs",
+    description="List recent jobs (newest first). Useful for debugging or resuming a session."
+)
+def list_recent_jobs(payload: RecentJobsInput) -> dict[str, Any]:
+    return {"jobs": [j.model_dump() for j in jobs.list_recent(payload.limit)]}
+
+
+# -------------------------------------------------------------------------
+# HTTP API (uploads + artifact delivery + status)
+# -------------------------------------------------------------------------
+app = FastAPI(
+    title="AuralMind FastMCP Mastering Server",
+    version="1.0.0",
+    description="FastAPI + FastMCP wrapper around a user-supplied AuralMind Python mastering script",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten in production if you front this with a trusted UI
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/healthz")
+def healthz() -> dict[str, Any]:
+    try:
+        preset_names = engine.get_preset_names()
+        return {
+            "ok": True,
+            "time": _iso(),
+            "jobs_dir": str(JOBS_DIR),
+            "engine_script_path": SCRIPT_PATH,
+            "preset_count": len(preset_names),
+            "presets": preset_names,
+        }
     except Exception as e:
-        script_ok = False
-        script_err = f"{type(e).__name__}: {e}"
+        return {"ok": False, "time": _iso(), "error": f"{type(e).__name__}: {e}"}
 
-    return {
-        "ok": True,
-        "server": APP_NAME,
-        "time_utc": _iso_now(),
-        "script_ok": script_ok,
-        "script_error": script_err,
-        "jobs_total": len(JOBS),
-        "files_total": len(FILES),
-    }
+@app.get("/api/presets")
+def api_presets() -> dict[str, Any]:
+    return list_presets()
 
+@app.get("/api/presets/{preset_name}")
+def api_preset_detail(preset_name: str) -> dict[str, Any]:
+    try:
+        return get_preset(PresetLookupInput(preset=preset_name))
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-@app.post("/api/upload-audio")
-async def upload_audio(file: UploadFile = File(...)) -> Dict[str, Any]:
+@app.post("/api/jobs/upload")
+async def create_job_via_upload(
+    request: Request,
+    target_file: UploadFile = File(..., description="Target song to master"),
+    reference_file: UploadFile | None = File(default=None, description="Optional reference track"),
+    preset: str = Form(default=DEFAULT_PRESET),
+    overrides_json: str = Form(default="{}"),
+    notes_for_llm: str | None = Form(default=None),
+    dither_seed: int = Form(default=0),
+) -> JSONResponse:
+    """Multipart upload endpoint for non-MCP clients (browser/cURL/Postman).
+
+    ChatGPT MCP tool calls usually prefer `start_master_job(source_url=...)` because tool inputs are JSON.
     """
-    Manual upload path (helpful if ChatGPT attachment passthrough is not available in your setup).
-    After upload, pass returned audio_id to MCP tools.
-    """
-    original_name = _safe_filename(file.filename or "upload.wav")
-    ext = Path(original_name).suffix.lower()
-    if ext not in ALLOWED_AUDIO_EXTS:
-        raise HTTPException(status_code=400, detail=f"Unsupported audio extension: {ext}")
+    try:
+        overrides = json.loads(overrides_json or "{}")
+        if not isinstance(overrides, dict):
+            raise ValueError("overrides_json must decode to an object")
+        engine.validate_overrides(overrides)
+        engine.split_virtual_master_args(overrides)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid overrides_json: {e}") from e
 
-    out_name = f"{uuid.uuid4().hex}_{original_name}"
-    out_path = _ensure_within(INBOX_DIR, INBOX_DIR / out_name)
+    job_id = uuid.uuid4().hex
+    job_dir = jobs._job_dir(job_id)
+    target_name = _safe_filename(target_file.filename or "target.wav", "target.wav")
+    target_dest = job_dir / target_name
+    await _save_uploadfile(target_file, target_dest)
 
-    total = 0
-    with out_path.open("wb") as f:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > MAX_UPLOAD_BYTES:
-                out_path.unlink(missing_ok=True)
-                raise HTTPException(status_code=413, detail=f"File too large. Max {MAX_UPLOAD_MB} MB.")
-            f.write(chunk)
+    source = {"mode": "local_path", "path": str(target_dest), "uploaded_via": "multipart"}
 
-    audio_id = _register_file(out_path, original_name, source="rest_upload")
+    reference = None
+    if reference_file is not None:
+        ref_name = _safe_filename(reference_file.filename or "reference.wav", "reference.wav")
+        ref_dest = job_dir / ref_name
+        await _save_uploadfile(reference_file, ref_dest)
+        reference = {"mode": "local_path", "path": str(ref_dest), "uploaded_via": "multipart"}
 
-    return {
-        "audio_id": audio_id,
-        "stored_path": str(out_path),
-        "original_name": original_name,
-        "size_bytes": total,
-    }
+    # Temporarily allow local file semantics for server-side staged uploads.
+    # We pass local paths inside the jobs dir and the job runner copies them into canonical names.
+    prev = os.environ.get("ALLOW_LOCAL_FILES")
+    os.environ["ALLOW_LOCAL_FILES"] = "true"
+    global ALLOW_LOCAL_FILES
+    old_allow_local = ALLOW_LOCAL_FILES
+    ALLOW_LOCAL_FILES = True
+    try:
+        view = jobs.submit(
+            source=source,
+            reference=reference,
+            preset=preset,
+            overrides=overrides,
+            notes_for_llm=notes_for_llm,
+            dither_seed=dither_seed,
+        )
+    finally:
+        ALLOW_LOCAL_FILES = old_allow_local
+        if prev is None:
+            os.environ.pop("ALLOW_LOCAL_FILES", None)
+        else:
+            os.environ["ALLOW_LOCAL_FILES"] = prev
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job": view.model_dump(),
+            "poll_url": _public_url(f"/api/jobs/{view.job_id}"),
+            "download_url": _public_url(f"/api/jobs/{view.job_id}/download"),
+            "report_url": _public_url(f"/api/jobs/{view.job_id}/report"),
+        },
+    )
+
+@app.post("/api/jobs/from-url")
+def create_job_from_url(payload: StartJobInput) -> JSONResponse:
+    # Reuse MCP validation logic
+    try:
+        data = start_master_job(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return JSONResponse(status_code=202, content=data)
+
+@app.get("/api/jobs")
+def list_jobs(limit: int = 20) -> dict[str, Any]:
+    return {"jobs": [j.model_dump() for j in jobs.list_recent(limit)]}
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str) -> dict[str, Any]:
+    try:
+        return jobs.get(job_id).to_view().model_dump()
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+@app.get("/api/jobs/{job_id}/result.json")
+def get_job_result_json(job_id: str):
+    try:
+        job = jobs.get(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Job not found")
+    path = job.paths.get("result_json")
+    if not path:
+        raise HTTPException(status_code=404, detail="Result JSON not available yet")
+    p = _ensure_private_path(Path(path), must_exist=True)
+    return FileResponse(p, media_type="application/json", filename=f"{job_id}_result.json")
+
+@app.get("/api/jobs/{job_id}/report")
+def get_job_report(job_id: str):
+    try:
+        job = jobs.get(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Job not found")
+    path = job.paths.get("report_md")
+    if not path:
+        raise HTTPException(status_code=404, detail="Report not available yet")
+    p = _ensure_private_path(Path(path), must_exist=True)
+    return FileResponse(p, media_type="text/markdown", filename=f"{job_id}_report.md")
+
+@app.get("/api/jobs/{job_id}/download")
+def download_master(job_id: str):
+    try:
+        job = jobs.get(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Job not completed (status={job.status})")
+
+    path = job.paths.get("mastered_audio")
+    if not path:
+        raise HTTPException(status_code=404, detail="Mastered output missing")
+
+    p = _ensure_private_path(Path(path), must_exist=True)
+    filename = _safe_filename(f"{job_id}_mastered{p.suffix or '.wav'}", f"{job_id}_mastered.wav")
+    return FileResponse(p, media_type="audio/wav", filename=filename)
+
+@app.post("/api/admin/reload-engine")
+def reload_engine() -> dict[str, Any]:
+    try:
+        return engine.reload()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
-@app.get("/download/{job_id}/{artifact}")
-def download_artifact(job_id: str, artifact: Literal["master", "report"]):
-    """
-    Download generated artifacts from a mastering job.
-    """
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
-        artifacts = job.get("artifacts") or {}
+# -------------------------------------------------------------------------
+# Mount the MCP ASGI app
+# -------------------------------------------------------------------------
+def _build_mcp_app():
+    """Support minor FastMCP version differences."""
+    # Newer versions commonly expose http_app(path="/mcp")
+    if hasattr(mcp, "http_app"):
+        try:
+            return mcp.http_app(path="/mcp")
+        except TypeError:
+            # Some versions accept no args
+            return mcp.http_app()
+    # Fallback seen in some versions
+    if hasattr(mcp, "streamable_http_app"):
+        return mcp.streamable_http_app()
+    raise RuntimeError("FastMCP version does not expose http_app() / streamable_http_app()")
 
-    key = "master_wav_path" if artifact == "master" else "report_path"
-    p_str = artifacts.get(key)
-    if not p_str:
-        raise HTTPException(status_code=404, detail=f"No {artifact} artifact for job {job_id}")
-
-    p = _ensure_within(JOBS_DIR, Path(p_str))
-    if not p.exists():
-        raise HTTPException(status_code=404, detail=f"Artifact missing on disk: {p}")
-
-    media_type = "audio/wav" if artifact == "master" else "text/markdown"
-    filename = p.name
-    return FileResponse(str(p), media_type=media_type, filename=filename)
+mcp_app = _build_mcp_app()
+# Mount LAST so /healthz and /api/* routes are matched first.
+app.mount("/", mcp_app)
 
 
-# Mount MCP ASGI sub-application at /mcp.
-# Using "/mcp" avoids shadowing the REST routes defined above.
-mcp_app = mcp.http_app(path="/mcp")
-app.mount("/mcp", mcp_app)
-
-
-# -----------------------------
-# Entrypoint
-# -----------------------------
-
+# -------------------------------------------------------------------------
+# Local entrypoint
+# -------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-
-    print(f"[{APP_NAME}] starting on {HOST}:{PORT}")
-    print(f"[{APP_NAME}] MCP endpoint: /mcp")
-    print(f"[{APP_NAME}] AuralMind script path: {SCRIPT_PATH}")
-    uvicorn.run(app, host=HOST, port=PORT)
+    uvicorn.run("server:app", host="127.0.0.1", port=int(os.getenv("PORT", "8000")), reload=True)

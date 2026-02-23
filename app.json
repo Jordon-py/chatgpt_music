@@ -1,0 +1,41 @@
+{
+  "name": "auralmind-fastmcp-server",
+  "description": "FastMCP + FastAPI wrapper for AuralMind mastering jobs (Heroku-ready scaffold)",
+  "env": {
+    "MCP_PUBLIC_BASE_URL": {
+      "description": "Public base URL for generating artifact links (e.g. https://your-app.herokuapp.com)",
+      "required": false
+    },
+    "AURALMIND_JOBS_DIR": {
+      "description": "Working directory for uploaded and rendered audio jobs (ephemeral on Heroku by default)",
+      "value": "/tmp/auralmind_jobs",
+      "required": false
+    },
+    "AURALMIND_SCRIPT_PATH": {
+      "description": "Path to the AuralMind mastering script file",
+      "value": "./auralmind_engine/auralmind_match_maestro_v7_3_expert1.py",
+      "required": false
+    },
+    "AURALMIND_DEFAULT_PRESET": {
+      "description": "Default preset used when none is provided",
+      "value": "competitive_trap",
+      "required": false
+    },
+    "MAX_UPLOAD_MB": {
+      "value": "200",
+      "required": false
+    },
+    "MAX_DOWNLOAD_MB": {
+      "value": "250",
+      "required": false
+    },
+    "ALLOW_LOCAL_FILES": {
+      "value": "false",
+      "required": false
+    },
+    "JOB_MAX_WORKERS": {
+      "value": "2",
+      "required": false
+    }
+  }
+}
