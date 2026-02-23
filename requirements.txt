@@ -1,0 +1,13 @@
+fastmcp
+fastapi
+uvicorn[standard]
+pydantic
+requests
+soundfile
+numpy
+scipy
+python-multipart
+torch
+demucs
+ffmpeg-python
+pydub
