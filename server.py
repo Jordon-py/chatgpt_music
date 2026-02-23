@@ -15,6 +15,7 @@ Deployment target
 """
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import logging
@@ -80,6 +81,10 @@ _allowed_hosts_env = os.getenv("ALLOWED_DOWNLOAD_HOSTS", "").strip()
 ALLOWED_DOWNLOAD_HOSTS = {h.strip().lower() for h in _allowed_hosts_env.split(",") if h.strip()}
 
 PUBLIC_BASE_URL = os.getenv("MCP_PUBLIC_BASE_URL", "").rstrip("/")
+
+# Stable per-process identity — changes on every restart / redeploy.
+SERVER_INSTANCE_ID = uuid.uuid4().hex
+SERVER_BOOT_TS = time.time()
 
 
 def _now_ts() -> float:
@@ -567,6 +572,44 @@ class RecentJobsInput(BaseModel):
     limit: int = Field(default=10, ge=1, le=50)
 
 
+class UploadJobInput(BaseModel):
+    """MCP tool input to create a mastering job from inline base64 audio data.
+
+    Use this instead of start_master_job when you have the raw file bytes
+    (e.g., from a ChatGPT file-upload action) and want to avoid URL
+    rewriting or path-proxy edge cases.
+    """
+    source_data_base64: str = Field(
+        description="Base64-encoded bytes of the target audio file (WAV/MP3/FLAC). "
+                    "Encode the raw file with standard base64 (no data-URI prefix)."
+    )
+    source_filename: str = Field(
+        default="target.wav",
+        description="Original filename including extension. Used to determine audio format."
+    )
+    reference_data_base64: Optional[str] = Field(
+        default=None,
+        description="Base64-encoded bytes of an optional reference track for tonal matching."
+    )
+    reference_filename: str = Field(
+        default="reference.wav",
+        description="Filename for the reference track."
+    )
+    preset: str = Field(
+        default=DEFAULT_PRESET,
+        description="Engine preset name. Call list_presets to see options."
+    )
+    overrides: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Preset field overrides (same as start_master_job)."
+    )
+    dither_seed: int = Field(default=0, description="Dither seed. 0 = random.")
+    notes_for_llm: Optional[str] = Field(
+        default=None,
+        description="Free-text note stored alongside the job."
+    )
+
+
 # -------------------------------------------------------------------------
 # FastMCP tools
 # -------------------------------------------------------------------------
@@ -578,15 +621,31 @@ mcp = FastMCP(
     instructions=(
         "You are connected to the AuralMind mastering engine. "
         "Follow this workflow to master a track:\n"
-        "1. Call server_health to confirm the engine is loaded.\n"
-        "2. Call list_presets to see available mastering presets.\n"
-        "3. (Optional) Call plan_trap_master with a high-level TrapMasterIntent to get recommended preset + overrides.\n"
-        "4. Call start_master_job with a source_url (or local_target_path in dev), preset, and overrides.\n"
-        "5. Poll get_job_status every 5-10 seconds until status is 'completed' or 'failed'.\n"
-        "6. When completed, the response includes download URLs for the mastered audio, report, and result JSON.\n"
+        "1. Call server_instance_id to get the current process ID (cache it; if it changes, the server restarted).\n"
+        "2. Call server_health to confirm the engine is loaded.\n"
+        "3. Call list_presets to see available mastering presets.\n"
+        "4. (Optional) Call plan_trap_master with a high-level TrapMasterIntent to get recommended preset + overrides.\n"
+        "5. Call start_master_job (with source_url) OR start_master_job_from_upload (with base64 audio data).\n"
+        "6. Poll get_job_status every 5-10 seconds until status is 'completed' or 'failed'.\n"
+        "7. When completed, the response includes download URLs for the mastered audio, report, and result JSON.\n"
         "If a job fails, check the 'error' field in get_job_status for diagnostics."
     ),
 )
+
+@mcp.tool(
+    name="server_instance_id",
+    description=(
+        "Return a stable instance ID (UUID hex) and boot timestamp for this server process. "
+        "The ID changes every time the server restarts or redeploys. "
+        "Use this to detect reloads: if the ID differs from the last call, rebind/re-init your session."
+    ),
+)
+def server_instance_id() -> dict[str, Any]:
+    return {
+        "instance_id": SERVER_INSTANCE_ID,
+        "boot_time": _iso(SERVER_BOOT_TS),
+        "uptime_seconds": round(time.time() - SERVER_BOOT_TS, 1),
+    }
 
 @mcp.tool(
     name="server_health",
@@ -730,6 +789,69 @@ def get_job_status(payload: JobLookupInput) -> dict[str, Any]:
 )
 def list_recent_jobs(payload: RecentJobsInput) -> dict[str, Any]:
     return {"jobs": [j.model_dump() for j in jobs.list_recent(payload.limit)]}
+
+@mcp.tool(
+    name="start_master_job_from_upload",
+    description=(
+        "Queue a mastering job from base64-encoded audio data. "
+        "Use this when you have the raw file bytes (e.g., from a ChatGPT file-upload action) "
+        "and want to skip URL downloads or local-path plumbing. "
+        "Encode the audio file with standard base64 (no data-URI prefix). "
+        "After calling, poll get_job_status with the returned job_id until completed."
+    ),
+)
+def start_master_job_from_upload(payload: UploadJobInput) -> dict[str, Any]:
+    # Validate overrides up front.
+    engine.validate_overrides(payload.overrides)
+    engine.split_virtual_master_args(payload.overrides)
+
+    # Decode source audio.
+    try:
+        source_bytes = base64.b64decode(payload.source_data_base64, validate=True)
+    except Exception as e:
+        raise ValueError(f"source_data_base64 is not valid base64: {e}") from e
+    if len(source_bytes) < 128:
+        raise ValueError("Decoded source audio is too small to be a valid file")
+
+    job_id = uuid.uuid4().hex
+    job_dir = jobs._job_dir(job_id)
+    target_name = _safe_filename(payload.source_filename, "target.wav")
+    target_dest = job_dir / target_name
+    target_dest.write_bytes(source_bytes)
+
+    source = {"mode": "local_path", "path": str(target_dest), "uploaded_via": "mcp_base64"}
+
+    # Decode optional reference.
+    reference = None
+    if payload.reference_data_base64:
+        try:
+            ref_bytes = base64.b64decode(payload.reference_data_base64, validate=True)
+        except Exception as e:
+            raise ValueError(f"reference_data_base64 is not valid base64: {e}") from e
+        ref_name = _safe_filename(payload.reference_filename, "reference.wav")
+        ref_dest = job_dir / ref_name
+        ref_dest.write_bytes(ref_bytes)
+        reference = {"mode": "local_path", "path": str(ref_dest), "uploaded_via": "mcp_base64"}
+
+    # Submit with local-file semantics (files are already in jobs dir).
+    prev_allow = ALLOW_LOCAL_FILES
+    globals()["ALLOW_LOCAL_FILES"] = True
+    try:
+        view = jobs.submit(
+            source=source,
+            reference=reference,
+            preset=payload.preset,
+            overrides=payload.overrides,
+            notes_for_llm=payload.notes_for_llm,
+            dither_seed=payload.dither_seed,
+        )
+    finally:
+        globals()["ALLOW_LOCAL_FILES"] = prev_allow
+
+    return {
+        "job": view.model_dump(),
+        "next_step": "Call get_job_status with the returned job_id until status is completed or failed.",
+    }
 
 
 # -------------------------------------------------------------------------
