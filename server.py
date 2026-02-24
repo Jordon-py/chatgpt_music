@@ -62,7 +62,7 @@ def download_file(url: str) -> str:
 # ---------------------------------------------------------
 
 
-@mcp.tool
+@mcp_tool
 def list_presets() -> PresetsResponse:
     """
     Returns available mastering presets.
@@ -75,7 +75,7 @@ def list_presets() -> PresetsResponse:
     )
 
 
-@mcp.tool
+@mcp_tool
 def analyze_audio(request: AnalyzeRequest) -> AnalyzeResponse:
     """
     Analyze audio from URL.
@@ -100,7 +100,7 @@ def analyze_audio(request: AnalyzeRequest) -> AnalyzeResponse:
     )
 
 
-@mcp.tool
+@mcp_tool
 def master_audio(request: MasterRequest) -> MasterResponse:
     """
     Master audio from URL.
