@@ -1,11 +1,7 @@
 {
   "name": "auralmind-fastmcp-server",
-  "description": "FastMCP + FastAPI wrapper for AuralMind mastering jobs (Heroku-ready scaffold)",
+  "description": "FastMCP server for AuralMind mastering jobs (Heroku-ready scaffold)",
   "env": {
-    "MCP_PUBLIC_BASE_URL": {
-      "description": "Public base URL for generating artifact links (e.g. https://your-app.herokuapp.com)",
-      "required": false
-    },
     "AURALMIND_JOBS_DIR": {
       "description": "Working directory for uploaded and rendered audio jobs (ephemeral on Heroku by default)",
       "value": "/tmp/auralmind_jobs",
@@ -21,6 +17,11 @@
       "value": "competitive_trap",
       "required": false
     },
+    "MAX_JSON_MB": {
+      "description": "JSON body cap for base64 uploads via MCP tools",
+      "value": "100",
+      "required": false
+    },
     "MAX_UPLOAD_MB": {
       "value": "200",
       "required": false
@@ -31,6 +32,11 @@
     },
     "ALLOW_LOCAL_FILES": {
       "value": "false",
+      "required": false
+    },
+    "FASTMCP_HTTP_PATH": {
+      "description": "HTTP endpoint path for MCP (default /mcp)",
+      "value": "/mcp",
       "required": false
     },
     "JOB_MAX_WORKERS": {
