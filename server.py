@@ -8,7 +8,6 @@ import os
 import uvicorn
 import httpx
 from fastmcp import FastMCP
-
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from auralmind_engine.models import (
@@ -30,16 +29,7 @@ from auralmind_engine.auralmind_match_maestro_v7_3_expert1 import (
 # Server Instance
 # ---------------------------------------------------------
 
-mcp = FastMCP(name="AuralMind Mastering MCP", param_tools=[list_presets, analyze_audio, master_audio],
-             webhook_url="https://chatgpt-music.onrender.com",
-             middleware=[
-                 Middleware(
-                     CORSMiddleware,
-                     allow_origins=["*"],
-                     allow_methods=["*"],
-                     allow_headers=["*"],
-                 )
-             ], list_tools=True, lifespan=mcp.lifespan)
+mcp = FastMCP("AuralMind Mastering MCP")
 
 
 # ---------------------------------------------------------
@@ -50,8 +40,7 @@ TEMP_DIR = "./jobs"
 
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-@mcp_tool
-def download_file(url: str = str or file_path) -> str:
+def download_file(url: str) -> str:
 
     local_path = os.path.join(
         TEMP_DIR,
@@ -72,7 +61,7 @@ def download_file(url: str = str or file_path) -> str:
 # ---------------------------------------------------------
 
 
-@mcp_tool
+@mcp.tool
 def list_presets() -> PresetsResponse:
     """
     Returns available mastering presets.
@@ -83,9 +72,7 @@ def list_presets() -> PresetsResponse:
         message="Presets loaded",
         presets=presets
     )
-@mcp.add_resource("/download_file", download_file)
-
-@mcp_tool
+@mcp.tool
 def analyze_audio(request: AnalyzeRequest) -> AnalyzeResponse:
     """
     Analyze audio from URL.
@@ -110,7 +97,7 @@ def analyze_audio(request: AnalyzeRequest) -> AnalyzeResponse:
     )
 
 
-@mcp_tool
+@mcp.tool
 def master_audio(request: MasterRequest) -> MasterResponse:
     """
     Master audio from URL.
