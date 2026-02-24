@@ -1,6 +1,6 @@
 # AuralMind FastMCP Mastering Server (Heroku Ready)
 
-A production-oriented **FastMCP + FastAPI scaffold** that wraps your AuralMind Python mastering script so ChatGPT (via Developer Mode) can plan and run mastering jobs using tool-calls.
+A production-oriented **FastMCP server** that wraps your AuralMind Python mastering script so ChatGPT (via Developer Mode) can plan and run mastering jobs using tool-calls.
 
 ## Features
 
@@ -11,11 +11,10 @@ A production-oriented **FastMCP + FastAPI scaffold** that wraps your AuralMind P
   - start job
   - poll job status
   - list recent jobs
-- ✅ **HTTP API** for:
-  - multipart uploads
-  - URL-based job creation
-  - status polling
-  - WAV/report/result downloads
+- ✅ **MCP resources** for:
+  - mastered audio
+  - reports
+  - result JSON
 - ✅ **Heroku-ready**:
   - `Procfile`
   - `.python-version`
@@ -72,24 +71,28 @@ Copy-Item .env.example .env
 
 Recommended local values:
 ```env
-MCP_PUBLIC_BASE_URL=http://127.0.0.1:8000
 AURALMIND_JOBS_DIR=./jobs
 ALLOW_LOCAL_FILES=true
 AURALMIND_DEFAULT_PRESET=competitive_trap
 JOB_MAX_WORKERS=1
+FASTMCP_HTTP_PATH=/mcp
 ```
 
 ### 3) Run
 
 ```powershell
-uvicorn server:app --host 127.0.0.1 --port 8000 --reload
+python server.py
+```
+
+Or:
+```powershell
+fastmcp run server.py --transport http --host 127.0.0.1 --port 3333
 ```
 
 ### 4) Smoke checks
 
-- `GET /healthz`
-- `GET /api/presets`
-- MCP endpoint path is mounted by FastMCP (commonly `/mcp`, depending on your installed `fastmcp` version)
+- MCP endpoint: `http://127.0.0.1:3333/mcp`
+- Use your MCP client to call `server_health` and `list_presets`
 
 ---
 
@@ -102,7 +105,6 @@ heroku create your-auralmind-mcp
 
 ### 2) Set config vars
 ```bash
-heroku config:set MCP_PUBLIC_BASE_URL=https://your-auralmind-mcp.herokuapp.com
 heroku config:set AURALMIND_JOBS_DIR=/tmp/auralmind_jobs
 heroku config:set ALLOW_LOCAL_FILES=false
 heroku config:set AURALMIND_DEFAULT_PRESET=competitive_trap
@@ -124,7 +126,8 @@ git push heroku main
 ```
 
 ### 4) Verify
-- open `https://your-auralmind-mcp.herokuapp.com/healthz`
+- MCP endpoint: `https://your-auralmind-mcp.herokuapp.com/mcp`
+- Use your MCP client to call `server_health`
 - inspect logs:
 ```bash
 heroku logs --tail
@@ -138,12 +141,12 @@ heroku logs --tail
 
 1. Deploy this server to a **public HTTPS** URL.
 2. Enable ChatGPT **Developer Mode** (if available on your plan/workspace).
-3. Add your custom connector/app and point it to your MCP URL.
+3. Add your custom connector/app and point it to your MCP URL (e.g., `https://your-auralmind-mcp.herokuapp.com/mcp`).
 4. Ask ChatGPT to:
    - call `plan_trap_master`
    - call `start_master_job_from_upload` for uploaded bytes (or `start_master_job` for URLs)
    - poll `get_job_status`
-   - return the download/report links
+   - use `read_resource` on the returned resource URIs to fetch artifacts
 
 > If you are testing locally first, use a secure tunnel (Cloudflare Tunnel / ngrok) to expose your local server over HTTPS.
 
@@ -187,62 +190,30 @@ Queues a mastering job using:
 ### `get_job_status`
 Polling endpoint/tool for long-running renders.
 
+Artifacts are exposed as MCP resources:
+- `auralmind://jobs/<job_id>/mastered_audio`
+- `auralmind://jobs/<job_id>/report`
+- `auralmind://jobs/<job_id>/result_json`
+
+Use `read_resource` (or `list_resources`) to fetch them. Binary content is base64-encoded when accessed via the tool transform.
+
 ### `list_recent_jobs`
 Debug/resume helper.
 
 ---
 
-## HTTP API Quick Examples
-
-### Create a job from URL
-```bash
-curl -X POST "http://127.0.0.1:8000/api/jobs/from-url" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "source_url": "https://example.com/path/song.wav",
-    "preset": "competitive_trap",
-    "overrides": {
-      "target_lufs": -10.2,
-      "hooklift_auto": true,
-      "transient_sculpt_mix": 0.28,
-      "out_subtype": "PCM_24",
-      "dither": true
-    }
-  }'
-```
-
-### Create a job by multipart upload
-```bash
-curl -X POST "http://127.0.0.1:8000/api/jobs/upload" \
-  -F "target_file=@C:/path/to/song.wav" \
-  -F "preset=competitive_trap" \
-  -F "overrides_json={\"target_lufs\":-10.2,\"out_subtype\":\"PCM_24\",\"dither\":true}"
-```
-
-### Poll job status
-```bash
-curl "http://127.0.0.1:8000/api/jobs/<job_id>"
-```
-
-### Download mastered WAV
-```bash
-curl -L "http://127.0.0.1:8000/api/jobs/<job_id>/download" -o mastered.wav
-```
-
----
-
 ## Environment Variables
 
-- `MCP_PUBLIC_BASE_URL` - used to generate absolute URLs in responses
 - `AURALMIND_JOBS_DIR` - working dir for job files (`/tmp/auralmind_jobs` by default)
-- `MAX_JSON_MB` - JSON body cap (base64 uploads via MCP tools)
-- `MAX_UPLOAD_MB` - multipart upload cap
+- `MAX_JSON_MB` - base64 payload cap (applied to MCP tool inputs)
+- `MAX_UPLOAD_MB` - decoded audio size cap for base64 uploads
 - `MAX_DOWNLOAD_MB` - remote URL download cap
-- `ALLOWED_DOWNLOAD_HOSTS` — optional comma-separated hostname allowlist
-- `ALLOW_LOCAL_FILES` — dev-only local path mode (`false` in production)
-- `AURALMIND_SCRIPT_PATH` — path to your mastering script
-- `AURALMIND_DEFAULT_PRESET` — fallback preset name
-- `JOB_MAX_WORKERS` — thread pool workers
+- `ALLOWED_DOWNLOAD_HOSTS` - optional comma-separated hostname allowlist
+- `ALLOW_LOCAL_FILES` - dev-only local path mode (`false` in production)
+- `AURALMIND_SCRIPT_PATH` - path to your mastering script
+- `AURALMIND_DEFAULT_PRESET` - fallback preset name
+- `JOB_MAX_WORKERS` - thread pool workers
+- `FASTMCP_HTTP_PATH` - HTTP endpoint path (default `/mcp`)
 
 ---
 
@@ -268,9 +239,9 @@ You should still add:
 
 ## Troubleshooting
 
-### `fastmcp` mount/path issues
-FastMCP versions can differ (`http_app(...)` vs `streamable_http_app()` behavior).  
-`server.py` includes a compatibility fallback in `_build_mcp_app()`.
+### MCP endpoint path
+FastMCP serves the HTTP endpoint at `/mcp` by default.  
+Set `FASTMCP_HTTP_PATH` if you need a custom path and update your client URL.
 
 ### Engine import fails
 - Verify `AURALMIND_SCRIPT_PATH`
