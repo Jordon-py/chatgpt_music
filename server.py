@@ -7,7 +7,7 @@ ChatGPT Developer Mode Compatible
 import os
 import uvicorn
 import httpx
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP, mcp_tool
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from auralmind_engine.models import (
@@ -29,7 +29,16 @@ from auralmind_engine.auralmind_match_maestro_v7_3_expert1 import (
 # Server Instance
 # ---------------------------------------------------------
 
-mcp = FastMCP("AuralMind Mastering MCP")
+mcp = FastMCP(name="AuralMind Mastering MCP", param_tools=[list_presets, analyze_audio, master_audio],
+             webhook_url="https://chatgpt-music.onrender.com",
+             middleware=[
+                 Middleware(
+                     CORSMiddleware,
+                     allow_origins=["*"],
+                     allow_methods=["*"],
+                     allow_headers=["*"],
+                 )
+             ], list_tools=True, lifespan=mcp.lifespan)
 
 
 # ---------------------------------------------------------
@@ -40,8 +49,8 @@ TEMP_DIR = "./jobs"
 
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-
-def download_file(url: str) -> str:
+@mcp_tool
+def download_file(url: str = str or file_path) -> str:
 
     local_path = os.path.join(
         TEMP_DIR,
@@ -73,7 +82,7 @@ def list_presets() -> PresetsResponse:
         message="Presets loaded",
         presets=presets
     )
-
+@mcp.add_resource("/download_file", download_file)
 
 @mcp_tool
 def analyze_audio(request: AnalyzeRequest) -> AnalyzeResponse:
