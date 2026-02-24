@@ -1,12 +1,32 @@
+# Python
 __pycache__/
 *.pyc
-.pytest_cache/
-.mypy_cache/
+*.pyo
+*.pyd
+
+# Virtual environments
 .venv/
-venv/
+.venv-*/
+
+# Environment files
 .env
-.DS_Store
-data/
-tmp/
+
+# Packaging
+*.egg-info/
+build/
+dist/
+
+# Artifacts
 jobs/
+*.wav
+*.flac
+*.aiff
+*.ogg
+*.mp3
+*.m4a
+
+# Logs
 *.log
+
+# OS
+.DS_Store

@@ -1,6 +1,6 @@
 {
   "name": "auralmind-fastmcp-server",
-  "description": "FastMCP server for AuralMind mastering jobs (Heroku-ready scaffold)",
+  "description": "Render-ready AuralMind MCP server (streamable HTTP, ChatGPT Developer Mode compatible)",
   "env": {
     "AURALMIND_JOBS_DIR": {
       "description": "Working directory for uploaded and rendered audio jobs (ephemeral on Heroku by default)",
@@ -41,6 +41,26 @@
     },
     "JOB_MAX_WORKERS": {
       "value": "2",
+      "required": false
+    },
+    "PUBLIC_BASE_URL": {
+      "description": "Public base URL for generated output links (e.g. https://chatgpt-music.onrender.com)",
+      "value": "https://chatgpt-music.onrender.com",
+      "required": false
+    },
+    "LINK_BANK_FILE": {
+      "description": "Render secret file path containing one URL per line",
+      "value": "/etc/secrets/vegeta.txt",
+      "required": false
+    },
+    "LINK_BANK_FALLBACK": {
+      "description": "Local fallback file path for URL list when secret file is absent",
+      "value": "./list_urls.txt",
+      "required": false
+    },
+    "DOWNLOAD_TIMEOUT_S": {
+      "description": "Per-download read timeout for remote audio fetches",
+      "value": "180",
       "required": false
     }
   }
