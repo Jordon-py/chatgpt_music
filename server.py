@@ -7,7 +7,7 @@ ChatGPT Developer Mode Compatible
 import os
 import uvicorn
 import httpx
-from fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from auralmind_engine.models import (
